@@ -7,9 +7,12 @@
  ** DATE         : 29 May 2018
  ** AUTHOR       : Purnendu Ghosh
  ** DESCRIPTION  : QOS HAL Layer
- ** COPYRIGHT :   Copyright (c) 2020 - 2023 MaxLinear, Inc.
+ ** COPYRIGHT :   Copyright (c) 2020 - 2025 MaxLinear, Inc.
  **               Copyright (c) 2017 - 2018 Intel Corporation
  **               Copyright (c) 2010 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
+ **
+ ** For licensing information, see the file 'LICENSE' in the root folder of
+ ** this software module.
  **
  *****************************************************************************/
 

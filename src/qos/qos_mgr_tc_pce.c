@@ -1,6 +1,6 @@
 /******************************************************************************
  *
- * Copyright © 2020-2021 MaxLinear, Inc.
+ * Copyright © 2020-2025 MaxLinear, Inc.
  * Copyright (c) 2019 Intel Corporation
  *
  * For licensing information, see the file 'LICENSE' in the root folder of

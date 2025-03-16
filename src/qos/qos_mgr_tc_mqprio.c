@@ -5,9 +5,11 @@
  ** MODULES      : QOS MGR (TC APIs)
  **
  ** DESCRIPTION  : TC MQPRIO Offload Implementation
- ** COPYRIGHT 	 : Copyright © 2020 MaxLinear, Inc.
+ ** COPYRIGHT 	 : Copyright © 2025 MaxLinear, Inc.
  **                Copyright (c) 2019 - 2020 Intel Corporation
  **
+ ** For licensing information, see the file 'LICENSE' in the root folder of
+ ** this software module.
  *************************************************************************/
 #include "qos_mgr_tc.h"
 

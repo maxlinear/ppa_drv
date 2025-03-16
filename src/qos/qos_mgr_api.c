@@ -7,8 +7,11 @@
  ** DATE	: 08 Jan 2020
  ** AUTHOR	: Mohammed Aarif
  ** DESCRIPTION	: QoS Manager API Implementation
- ** COPYRIGHT  : Copyright (c) 2020 - 2024 MaxLinear, Inc.
+ ** COPYRIGHT  : Copyright (c) 2020 - 2025 MaxLinear, Inc.
  **              Copyright (c) 2019 - 2020 Intel Corporation
+ **
+ ** For licensing information, see the file 'LICENSE' in the root folder of
+ ** this software module.
  **
  ** HISTORY
  ** $Date		$Author			$Comment

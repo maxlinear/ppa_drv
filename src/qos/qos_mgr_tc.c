@@ -7,10 +7,12 @@
  ** DATE         : 18 APR 2018
  ** AUTHOR       : Purnendu Ghosh
  ** DESCRIPTION  : QOS MGR TC API Implementation
- ** COPYRIGHT    : Copyright © 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT    : Copyright © 2020-2025 MaxLinear, Inc.
  **                Copyright (c) 2017 - 2019 Intel Corporation
  **                Copyright (c) 2010 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
  **
+ ** For licensing information, see the file 'LICENSE' in the root folder of
+ ** this software module.
  *************************************************************************/
 #include <linux/debugfs.h>
 #include "qos_mgr_tc.h"

@@ -1,15 +1,14 @@
 /***************************************************************************
 
- * Copyright © 2020-2021 MaxLinear, Inc.
+ * Copyright © 2020-2025 MaxLinear, Inc.
  * Copyright (C) 2017-2018 Intel Corporation
  * Copyright (C) 2010-2016 Lantiq Beteiligungs-GmbH & Co. KG
  *  For licensing information, see the file 'LICENSE' in the root folder of
  *  this software module.
  * Author  : Purnendu Ghosh
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * 
+ * For licensing information, see the file 'LICENSE' in the root folder of
+ * this software module.
  *
  * SPDX-License-Identifier: GPL-2.0
  *
