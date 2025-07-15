@@ -807,6 +807,14 @@ static void ppa_unregister_new_netif(PPA_NETIF *netif)
 		ppa_netif_remove(ifname, f_is_lan);
 		return;
 	} else {
+		/* Removing wifi logical interfaces.
+		 * Since, p_ifinfo->phys_netif_name and p_ifinfo->name is same for logical interface.
+		 */
+		if (p_ifinfo->flags & NETIF_DIRECTCONNECT_WIFI) {
+			ppa_netif_remove(ifname, f_is_lan);
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+				"Removing logical wifi interface [%s]\n", ifname);
+		}
 		/* Physical netif removed from system.
 		 * So assigning NULL to PPA netif entry.
 		 */
@@ -1080,6 +1088,8 @@ static void ppa_netif_up(PPA_NETIF *netif)
 {
 	struct netif_info *p_ifinfo = NULL;
 	PPA_IFNAME *ifname = NULL;
+	dp_subif_t *dp_subif = NULL;
+
 	/* ppa_get_physical_if() fails for pppoe net_dev because call to
 	 * ppa_check_is_pppoe_netif() also validated only if pppoe_addr
 	 * is assigned to fetch the physical interface.
@@ -1091,6 +1101,25 @@ static void ppa_netif_up(PPA_NETIF *netif)
 	ifname = ppa_get_netif_name(netif);
 	if (ifname == NULL)
 		return;
+
+	dp_subif = ppa_malloc(sizeof(dp_subif_t));
+	if (!dp_subif) {
+		ppa_debug(DBG_ENABLE_MASK_ERR,
+			"[%s:%d] DP subif allocation failed\n", __func__, __LINE__);
+		return;
+	} else {
+		ppa_memset (dp_subif, 0, sizeof(dp_subif_t));
+		if (dp_get_netif_subifid(netif, NULL, NULL, NULL, dp_subif, 0) == DP_SUCCESS) {
+			if (dp_subif->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
+				if (ppa_netif_add(ifname, NETIF_LAN_IF, NULL, NULL, 0) != PPA_SUCCESS)
+					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "ppa_netif_add %s fail\n", ifname);
+			}
+		} else {
+			ppa_debug(DBG_ENABLE_MASK_ERR,
+				"%s : dp_get_netif_subifid Failed ifname: %s\n", __func__, ifname);
+		}
+		ppa_free(dp_subif);
+	}
 
 	if (ppa_get_netif_info(ifname, &p_ifinfo) == PPA_SUCCESS) {
 		p_ifinfo->enable = true;
@@ -1129,6 +1158,7 @@ static void ppa_netif_down(PPA_NETIF *netif)
 	struct netif_info *p_ifinfo = NULL;
 	PPA_IFNAME *ifname;
 	bool is_tc_configured = false;
+	dp_subif_t *dp_subif = NULL;
 
 	ifname = ppa_get_netif_name(netif);
 	if (ifname == NULL)
@@ -1157,6 +1187,24 @@ static void ppa_netif_down(PPA_NETIF *netif)
 	if ((ppa_check_is_ppp_netif(netif) || ppa_is_macvlan_if(netif, ifname)) &&
 			!is_tc_configured) {
 		ppa_unregister_new_netif(netif);
+	}
+
+	dp_subif = ppa_malloc(sizeof(dp_subif_t));
+	if (!dp_subif) {
+		ppa_debug(DBG_ENABLE_MASK_ERR,
+		"[%s:%d] DP subif allocation failed\n", __func__, __LINE__);
+		return;
+	} else {
+		ppa_memset (dp_subif, 0, sizeof(dp_subif_t));
+		if (dp_get_netif_subifid(netif, NULL, NULL, NULL, dp_subif, 0) == DP_SUCCESS) {
+			if (dp_subif->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
+				ppa_netif_remove(ifname, 1);
+				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "Remove ifname=%s Success\n", ifname);
+			}
+		} else {
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "dp_get_netif_subifid %s fails\n", ifname);
+		}
+		ppa_free(dp_subif);
 	}
 }
 

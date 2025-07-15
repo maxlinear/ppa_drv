@@ -7,7 +7,7 @@
 ** DATE		: 05 Feb 2014
 ** AUTHOR	: Kamal Eradath
 ** DESCRIPTION	: PAE hardware abstraction layer
- ** COPYRIGHT	: Copyright © 2020-2021 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright © 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2014, Lantiq Deutschland GmbH
  **               Am Campeon 3; 85579 Neubiberg, Germany
 **
@@ -6166,16 +6166,6 @@ static int32_t pae_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 			entry->max_tunnel_entries = MAX_TUNNEL_ENTRIES;
 
 			return PPA_SUCCESS;
-		}
-	case PPA_GENERIC_HAL_GET_HAL_VERSION: {
-			PPA_VERSION *v=(PPA_VERSION *)buffer;
-			get_pae_hal_id( &v->family, &v->type,&v->itf, &v->mode, &v->major, &v->mid, &v->minor );
-			return PPA_SUCCESS;
-		}
-	case PPA_GENERIC_HAL_GET_PPE_FW_VERSION: {
-			PPA_VERSION *v=(PPA_VERSION *)buffer;
-			get_pae_hal_id( &v->family, &v->type,&v->itf, &v->mode, &v->major, &v->mid, &v->minor );
-			return get_firmware_id(&v->id, v->name, v->version);
 		}
 	case PPA_GENERIC_HAL_GET_PHYS_PORT_NUM: {
 			PPA_COUNT_CFG *count=(PPA_COUNT_CFG *)buffer;

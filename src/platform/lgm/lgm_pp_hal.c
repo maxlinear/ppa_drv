@@ -7,7 +7,7 @@
 ** DATE		: 29 Oct 2018
 ** AUTHOR	: Kamal Eradath
 ** DESCRIPTION	: PPv4 hardware abstraction layer
-** COPYRIGHT	: Copyright (c) 2020-2024 MaxLinear, Inc.
+** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
 **                Copyright (c) 2014, Intel Corporation.
 **
 **	 For licensing information, see the file 'LICENSE' in the root folder of
@@ -95,20 +95,6 @@
 #if IS_ENABLED(CONFIG_SGAM)
 #include <net/sgam/sgam_api.h>
 #endif /* CONFIG_SGAM */
-
-/*
- * ####################################
- *			Version No.
- * ####################################
- */
-#define VER_FAMILY	0x10
-#define VER_DRTYPE	0x04 /* 4: Stack/System Adaption Layer driver*/
-#define VER_INTERFACE	0x1 /*	bit 0: MII 1 */
-#define VER_ACCMODE	0x11 /*	bit 0: Routing &Bridging */
-
-#define VER_MAJOR	1
-#define VER_MID		0
-#define VER_MINOR	0
 
 #define SESSION_RETRY_MAX	 8
 #define ETH_MTU	1500
@@ -269,30 +255,60 @@ static ssize_t proc_set_ppv4_bbf247_hgu(struct file *file,
 					size_t count, loff_t *data);
 #endif /*CONFIG_PPA_BBF247_MODE1*/
 #endif /*defined(PPA_API_PROC)*/
-struct client_info{
-	uint32_t sess_id;		/* Client session id */
-	struct net_device *netdev;	/* tx netdevice */
-	struct pp_hash sess_hash;	/* HW hash of the dst */
+
+/* mutlicast client entry */
+struct client_info {
+	uint32_t	sess_id;				/* client session id */
+	struct pp_hash	sess_hash;				/* client session hw hash */
+	struct eg_ref {
+		uint16_t		gid;			/* egress gid reference */
+		uint8_t			dstid;			/* egress dstid reference */
+		struct net_device	*netdev;		/* egress member device */
+	} eg;
 };
 
-/*Each client will have one session in pp*/
-typedef struct mc_db_nod {
-	bool		used;	/*index is in use*/
-	struct pp_stats	stats;	/*statistics per group*/
-	struct pp_hash  grp_sess_hash; /*HW hash of the group session*/
-	struct client_info dst[MAX_MC_CLIENT_PER_GRP]; /* mc clients*/
-} MC_DB_NODE;
+/* mutlicast ingress gid table entry */
+struct ig_node {
+	struct pp_stats		stats;				/* group statistics */
+	uint32_t		sess_id;			/* group session id */
+	struct pp_hash		grp_sess_hash;			/* group session hw hash */
+	DECLARE_BITMAP(dstid_bitmap, MAX_MC_CLIENT_PER_GRP + 1);/* client index bitmap */
+	int			num_gid;			/* egress group ref count */
+	struct client_info	dst[MAX_MC_CLIENT_PER_GRP];	/* mc clients */
+	struct stream_info {
+		IP_ADDR_C		grp_ip;			/* group ip */
+		IP_ADDR_C		src_ip;			/* source ip */
+		struct net_device	*rxdev;			/* rx device */
+	} stream;
+};
 
+/* multicast egress gid table entry */
+struct eg_node {
+	DECLARE_BITMAP(dstid_bitmap, MAX_MC_CLIENT_PER_GRP + 1);/* client index bitmap */
+	struct {
+		uint16_t	ig_gid;				/* ingress gid reference */
+		uint8_t		ig_dstid[MAX_MC_CLIENT_PER_GRP];/* ingress dstid reference */
+	};
+};
+
+/* multicast gid table */
+typedef struct mc_db_node {
+	struct ig_node	ig[MAX_MC_GROUP_ENTRIES];		/* ingress gid table */
+	DECLARE_BITMAP(ig_gid_bitmap, MAX_MC_GROUP_ENTRIES + 1);/* ingress gid bitmap */
+
+	struct eg_node	eg[MAX_MC_GROUP_ENTRIES];		/* egress gid table */
+	DECLARE_BITMAP(eg_gid_bitmap, MAX_MC_GROUP_ENTRIES + 1);/* egress gid bitmap */
+} MC_DB_NODE;
 
 /*Each unicast entry in pp will need following information kept in hal*/
 typedef struct uc_db_node {
-	bool			used;	/*index is in use*/
-	struct pp_stats		stats;	/*statistics*/
-	void 			*node; 	/*unicast session node pointer*/
+	bool			    used;	/*index is in use*/
+	struct pp_stats		*stats;	/*statistics*/
+	void 			    *node; 	/*unicast session node pointer*/
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
 	struct lp_info		*lp_rxinfo; /*litepath rx packet info*/
 #endif /*IS_ENABLED(LITEPATH_HW_OFFLOAD)*/
-	bool			lro;	/*lro session*/
+	bool			    lro;	/*lro session*/
 } PP_HAL_DB_NODE;
 
 
@@ -473,7 +489,7 @@ static PP_IPSEC_TUN_NODE ipsec_tun_db[MAX_TUN_ENTRIES]={0};
 #endif /* CONFIG_INTEL_VPN || CONFIG_MXL_VPN */
 
 /*multicast group DB*/
-static MC_DB_NODE mc_db[MAX_MC_GROUP_ENTRIES]={0};
+static MC_DB_NODE mc_db = {0};
 /*DB to maintain pp status in pp hal */
 static PP_HAL_DB_NODE	*pp_hal_db=NULL;
 /*DB to maintain IPSec tunnel entries*/
@@ -802,17 +818,6 @@ extern uint32_t ppa_drv_deregister_cap(PPA_API_CAPS cap, PPA_HAL_ID hal_id);
 static int p_flg = 0;
 #endif /*IS_ENABLED(PRINT_SKB)*/
 
-static int get_soc_rev(void)
-{
-	struct cbm_ops *cqm_ops = NULL;
-
-	cqm_ops = (struct cbm_ops *)dp_get_ops(0, DP_OPS_CQM);
-	if (cqm_ops && cqm_ops->cqm_get_version)
-		return cqm_ops->cqm_get_version();
-
-	return -1;
-}
-
 static inline void dumpskb(uint8_t *ptr, int len, int flag)
 {
 #if IS_ENABLED(PRINT_SKB)
@@ -900,6 +905,520 @@ static inline uint16_t get_cpu_qid(void)
 	return 2;
 }
 
+#define mc_ig_dst(ig_gid, ig_dstid)	\
+	((struct client_info *)(&mc_db.ig[ig_gid].dst[ig_dstid]))
+#define for_each_eg_dst(eg_gid, eg_dstid)	\
+	for_each_set_bit(eg_dstid, mc_db.eg[eg_gid].dstid_bitmap, MAX_MC_CLIENT_PER_GRP)
+#define for_each_ig_dst(ig_gid, ig_dstid)	\
+	for_each_set_bit(ig_dstid, mc_db.ig[ig_gid].dstid_bitmap, MAX_MC_CLIENT_PER_GRP)
+
+static uint16_t mc_gid_map_eg_to_ig(uint16_t eg_gid);
+
+static bool mc_gid_is_valid(uint16_t gid)
+{
+	return (gid < MAX_MC_GROUP_ENTRIES);
+}
+
+static bool mc_dstid_is_valid(uint8_t dstid)
+{
+	return (dstid < MAX_MC_CLIENT_PER_GRP);
+}
+
+static bool mc_ig_gid_is_exist(uint16_t ig_gid)
+{
+	return mc_gid_is_valid(ig_gid) &&
+	       test_bit(ig_gid, mc_db.ig_gid_bitmap);
+}
+
+static bool mc_eg_gid_is_exist(uint16_t eg_gid)
+{
+	return mc_gid_is_valid(eg_gid) &&
+	       test_bit(eg_gid, mc_db.eg_gid_bitmap);
+}
+
+static bool mc_ig_dstid_is_exist(uint16_t ig_gid, uint8_t ig_dstid)
+{
+	return mc_ig_gid_is_exist(ig_gid) &&
+	       mc_dstid_is_valid(ig_dstid) &&
+	       test_bit(ig_dstid, mc_db.ig[ig_gid].dstid_bitmap);
+}
+
+static bool mc_eg_dstid_is_exist(uint16_t eg_gid, uint8_t eg_dstid)
+{
+	return mc_eg_gid_is_exist(eg_gid) &&
+	       mc_dstid_is_valid(eg_dstid) &&
+	       test_bit(eg_dstid, mc_db.eg[eg_gid].dstid_bitmap);
+}
+
+static uint16_t mc_gid_map_ig_to_eg(uint16_t ig_gid, uint8_t ig_dstid)
+{
+	return mc_ig_dst(ig_gid, ig_dstid)->eg.gid;
+}
+
+static uint16_t mc_gid_map_eg_to_ig(uint16_t eg_gid)
+{
+	return mc_db.eg[eg_gid].ig_gid;
+}
+
+static uint8_t mc_dstid_map_eg_to_ig(uint16_t eg_gid, uint8_t eg_dstid)
+{
+	return mc_db.eg[eg_gid].ig_dstid[eg_dstid];
+}
+
+static uint16_t mc_ig_gid_alloc(struct stream_info *stream)
+{
+	uint16_t ig_gid;
+
+	/* find existing group by matching stream */
+	for_each_set_bit(ig_gid, mc_db.ig_gid_bitmap, MAX_MC_GROUP_ENTRIES) {
+		if (!memcmp(&mc_db.ig[ig_gid].stream.grp_ip,
+			    &stream->grp_ip, sizeof(IP_ADDR_C)) &&
+		    !memcmp(&mc_db.ig[ig_gid].stream.src_ip,
+			    &stream->src_ip, sizeof(IP_ADDR_C)) &&
+		    mc_db.ig[ig_gid].stream.rxdev == stream->rxdev) {
+			mc_db.ig[ig_gid].num_gid++;
+			break;
+		}
+	}
+
+	/* new group if not exist */
+	if (!mc_gid_is_valid(ig_gid)) {
+		set_bit(0, mc_db.ig_gid_bitmap);
+		ig_gid = find_first_zero_bit(mc_db.ig_gid_bitmap, MAX_MC_GROUP_ENTRIES);
+		if (!mc_gid_is_valid(ig_gid)) {
+			dbg("max ig_gid %d reached!\n", ig_gid);
+			return ig_gid;
+		}
+
+		memset(&mc_db.ig[ig_gid], 0, sizeof(struct ig_node));
+		mc_db.ig[ig_gid].sess_id = ~0;
+		memcpy(&mc_db.ig[ig_gid].stream.grp_ip,
+		       &stream->grp_ip, sizeof(IP_ADDR_C));
+		memcpy(&mc_db.ig[ig_gid].stream.src_ip,
+		       &stream->src_ip, sizeof(IP_ADDR_C));
+		mc_db.ig[ig_gid].stream.rxdev = stream->rxdev;
+		mc_db.ig[ig_gid].num_gid = 1;
+		set_bit(ig_gid, mc_db.ig_gid_bitmap);
+	}
+	return ig_gid;
+}
+
+static void mc_grp_sess_delete(uint16_t ig_gid);
+static void mc_ig_gid_free(uint16_t ig_gid)
+{
+	mc_db.ig[ig_gid].num_gid--;
+	if (mc_db.ig[ig_gid].num_gid)
+		return;
+
+	/* delete the group session */
+	mc_grp_sess_delete(ig_gid);
+
+	memset(&mc_db.ig[ig_gid], 0, sizeof(struct ig_node));
+	clear_bit(ig_gid, mc_db.ig_gid_bitmap);
+}
+
+static uint8_t mc_ig_dstid_alloc(uint16_t ig_gid, struct eg_ref *eg_ref)
+{
+	int32_t ret;
+	uint8_t ig_dstid;
+
+	ig_dstid = find_first_zero_bit(mc_db.ig[ig_gid].dstid_bitmap, MAX_MC_CLIENT_PER_GRP);
+	if (ig_dstid >= MAX_MC_CLIENT_PER_GRP) {
+		dbg("max clients %d reached for ig_gid:%d\n", ig_dstid, ig_gid);
+		return ig_dstid;
+	}
+
+	/* set the client index bit in uC multicast group */
+	ret = pp_mcast_dst_set(ig_gid, ig_dstid, PPA_IF_ADD);
+	if (ret) {
+		dbg("ADD: pp_mcast_dst_set failed %d for ig_gid:%d ig_dstid:%d\n",
+		    ret, ig_gid, ig_dstid);
+		return MAX_MC_CLIENT_PER_GRP;
+	}
+
+	memset(mc_ig_dst(ig_gid, ig_dstid), 0, sizeof(struct client_info));
+	mc_ig_dst(ig_gid, ig_dstid)->sess_id = ~0;
+	memcpy(&mc_ig_dst(ig_gid, ig_dstid)->eg, eg_ref, sizeof(struct eg_ref));
+	set_bit(ig_dstid, mc_db.ig[ig_gid].dstid_bitmap);
+	return ig_dstid;
+}
+
+static void mc_dst_sess_delete(uint16_t ig_gid, uint8_t ig_dstid);
+static void mc_ig_dstid_free(uint16_t ig_gid, uint8_t ig_dstid)
+{
+	int32_t ret;
+
+	/* reset the client index bit in uC multicast group */
+	ret = pp_mcast_dst_set(ig_gid, ig_dstid, PPA_IF_DEL);
+	if (ret) {
+		dbg("DEL: pp_mcast_dst_set failed %d for ig_gid:%d ig_dstid:%d\n",
+		    ret, ig_gid, ig_dstid);
+	}
+
+	/* delete the client session */
+	mc_dst_sess_delete(ig_gid, ig_dstid);
+
+	memset(mc_ig_dst(ig_gid, ig_dstid), 0, sizeof(struct client_info));
+	clear_bit(ig_dstid, mc_db.ig[ig_gid].dstid_bitmap);
+}
+
+static int mc_eg_gid_add(uint16_t eg_gid, struct stream_info *stream)
+{
+	uint16_t ig_gid;
+
+	if (mc_eg_gid_is_exist(eg_gid))
+		return 0;
+
+	ig_gid = mc_ig_gid_alloc(stream);
+	if (!mc_gid_is_valid(ig_gid))
+		return PPA_FAILURE;
+
+	mc_db.eg[eg_gid].ig_gid = ig_gid;
+	set_bit(eg_gid, mc_db.eg_gid_bitmap);
+	return 0;
+}
+
+static void mc_eg_gid_remove(uint16_t eg_gid)
+{
+	if (!mc_eg_gid_is_exist(eg_gid))
+		return;
+
+	mc_ig_gid_free(mc_db.eg[eg_gid].ig_gid);
+
+	mc_db.eg[eg_gid].ig_gid = 0;
+	clear_bit(eg_gid, mc_db.eg_gid_bitmap);
+}
+
+static int mc_eg_dstid_add(struct eg_ref *eg_ref, struct stream_info *stream)
+{
+	int32_t ret;
+	uint16_t ig_gid;
+	uint8_t ig_dstid;
+
+	if (mc_eg_dstid_is_exist(eg_ref->gid, eg_ref->dstid))
+		return 0;
+
+	ret = mc_eg_gid_add(eg_ref->gid, stream);
+	if (ret)
+		return ret;
+
+	ig_gid = mc_gid_map_eg_to_ig(eg_ref->gid);
+	ig_dstid = mc_ig_dstid_alloc(ig_gid, eg_ref);
+	if (!mc_dstid_is_valid(ig_dstid)) {
+		mc_eg_gid_remove(eg_ref->gid);
+		return PPA_FAILURE;
+	}
+
+	set_bit(eg_ref->dstid, mc_db.eg[eg_ref->gid].dstid_bitmap);
+	mc_db.eg[eg_ref->gid].ig_dstid[eg_ref->dstid] = ig_dstid;
+	return 0;
+}
+
+static void mc_eg_dstid_remove(uint16_t eg_gid, uint8_t eg_dstid)
+{
+	if (!mc_eg_dstid_is_exist(eg_gid, eg_dstid))
+		return;
+
+	mc_ig_dstid_free(mc_db.eg[eg_gid].ig_gid,
+			 mc_db.eg[eg_gid].ig_dstid[eg_dstid]);
+
+	mc_db.eg[eg_gid].ig_dstid[eg_dstid] = 0;
+	clear_bit(eg_dstid, mc_db.eg[eg_gid].dstid_bitmap);
+	/* NOTE: need explicit mc_eg_gid_remove() to delete ig<->eg gid mapping */
+}
+
+static void mc_sess_args_prepare(struct pp_sess_create_args *pp_args)
+{
+	int32_t i;
+
+	memset(pp_args, 0, sizeof(*pp_args));
+
+	pp_args->color = PP_COLOR_GREEN;
+
+	/*TBD:Set the session group counters */
+	for (i = 0; i < ARRAY_SIZE(pp_args->sgc); i++)
+		pp_args->sgc[i] = PP_SGC_INVALID;
+	/*TBD: Set the token bucket metering */
+	for (i = 0; i < ARRAY_SIZE(pp_args->tbm); i++)
+		pp_args->tbm[i] = PP_TBM_INVALID;
+	/*End TBD Set*/
+}
+
+static int32_t mc_grp_sess_args_prepare(struct pp_sess_create_args *pp_args,
+					struct lgm_mc_args *mc_args,
+					struct mc_session_node *p_item,
+					uint16_t ig_gid)
+{
+	mc_sess_args_prepare(pp_args);
+
+	/* Fill in the Hash information */
+	pp_args->hash.h1 = mc_args->hwhash.h1;
+	pp_args->hash.h2 = mc_args->hwhash.h2;
+	pp_args->hash.sig = mc_args->hwhash.sig;
+
+	/*************Getting ingress and egress ports***************/
+	pp_args->in_port = mc_args->ig_gpid;
+
+	/* In case of multicast group session the egress gpid must be set
+	 * as ingress gpid for the uC to identify correct IGP
+	 */
+	pp_args->eg_port = g_mcast_nf.gpid;
+
+	/*egress qid static qid allocated during mc NF creation*/
+	pp_args->dst_q = g_mcast_nf.qid;
+
+	/* remove dst member protocol, if any */
+	if (p_item->flags & SESSION_VALID_VLAN_INS)
+		pktprs_proto_remove(mc_args->desc->tx,
+				    PKTPRS_PROTO_VLAN0, PKTPRS_HDR_LEVEL0);
+	if (p_item->flags & SESSION_VALID_OUT_VLAN_INS)
+		pktprs_proto_remove(mc_args->desc->tx,
+				    PKTPRS_PROTO_VLAN1, PKTPRS_HDR_LEVEL0);
+
+	/*Filling in the FV information*/
+	pp_args->rx = mc_args->desc->rx;
+	pp_args->tx = mc_args->desc->tx;
+	/*End of FV information*/
+
+	/* multicast group id bit[0-8] */
+	pp_args->ps = ig_gid & 0x1FF; /* SID */
+
+	/* multicast NF subif id [15:9]*/
+	pp_args->ps |= (g_mcast_nf.subif & 0x7F) << 9;
+
+	set_bit(PP_SESS_FLAG_PS_VALID_BIT, &pp_args->flags);
+
+	pp_args->mcast.grp_idx = ig_gid; /* SID */
+	/*Set the session flags */
+	set_bit(PP_SESS_FLAG_MCAST_GRP_BIT, &pp_args->flags);
+
+	return 0;
+}
+
+static int32_t mc_grp_sess_create(uint16_t ig_gid, struct pp_sess_create_args *pp_args,
+				  uint32_t *session_id)
+{
+	int32_t ret;
+
+	ret = pp_session_create(pp_args, session_id, NULL);
+	if (ret) {
+		PPA_HAL_RTSTATS_INC(mc_dropped_sess);
+		dbg("group session create failed %d for ig_gid:%d\n",
+		    ret, ig_gid);
+	} else {
+		spin_lock_bh(&g_hal_mc_db_lock);
+		if (mc_db.ig[ig_gid].stream.grp_ip.f_ipv6)
+			PPA_HAL_RTSTATS_INC(curr_mc_ipv6_session);
+		else
+			PPA_HAL_RTSTATS_INC(curr_mc_ipv4_session);
+
+		mc_db.ig[ig_gid].sess_id = *session_id;
+		mc_db.ig[ig_gid].grp_sess_hash.h1 = pp_args->hash.h1;
+		mc_db.ig[ig_gid].grp_sess_hash.h2 = pp_args->hash.h2;
+		spin_unlock_bh(&g_hal_mc_db_lock);
+	}
+	return ret;
+}
+
+static void mc_grp_sess_delete(uint16_t ig_gid)
+{
+	int32_t ret;
+
+	if (!is_valid_session(mc_db.ig[ig_gid].sess_id + 1))
+		return;
+
+	/* delete the grp session */
+	ret = pp_session_delete(mc_db.ig[ig_gid].sess_id, NULL);
+	if (ret) {
+		dbg("pp_session delete mcast grp sess ret Error:%d\n", ret);
+	} else {
+		if (mc_db.ig[ig_gid].stream.grp_ip.f_ipv6)
+			PPA_HAL_RTSTATS_DEC(curr_mc_ipv6_session);
+		else
+			PPA_HAL_RTSTATS_DEC(curr_mc_ipv4_session);
+
+		/* reset the db entry */
+		mc_db.ig[ig_gid].sess_id = ~0;
+		mc_db.ig[ig_gid].grp_sess_hash.h1 = 0;
+		mc_db.ig[ig_gid].grp_sess_hash.h2 = 0;
+		ppa_memset(&mc_db.ig[ig_gid].stats, 0, sizeof(struct pp_stats));
+	}
+}
+
+static uint32_t ppa_update_pkt_devqos_priority(PPA_NETIF *dev, PPA_SUBIF *subif,
+					       PPA_BUF *skb, uint32_t prio);
+static int32_t mc_dst_sess_egress_set(struct pp_sess_create_args *pp_args,
+				      struct lgm_mc_args *mc_args,
+				      struct mc_session_node *p_item)
+{
+	PPA_SUBIF *dp_port;
+	PPA_NETIF *txif, *txif_phys;
+	struct netdev_attr qos_attr = {0};
+	uint32_t grp_prio;
+	uint16_t ig_gid, eg_gid;
+	uint8_t ig_dstid;
+
+	ig_gid = mc_args->groupid;
+	ig_dstid = mc_args->dst_idx;
+	eg_gid = p_item->grp.group_id;
+
+	dp_port = ppa_malloc(sizeof(PPA_SUBIF));
+	if (!dp_port) {
+		dbg("DP subif allocation failed!\n");
+		return -PPA_ENOMEM;
+	}
+	ppa_memset(dp_port, 0, sizeof(PPA_SUBIF));
+
+	/* egress interface */
+	txif = mc_ig_dst(ig_gid, ig_dstid)->eg.netdev;
+	txif_phys = ppa_dev_get_by_index(pp_args->tx->ifindex);
+	ppa_put_netif(txif_phys);
+
+	/*************Get the egress gpid from the tx netdevice******/
+	if (dp_get_netif_subifid(txif_phys, NULL, NULL, NULL, dp_port, 0)) {
+		dbg("dp_get_netif_subifid failed for dev:%s!\n",
+		    ppa_get_netif_name(txif_phys));
+		ppa_free(dp_port);
+		return PPA_FAILURE;
+	}
+
+	/* egress gpid */
+	pp_args->eg_port = dp_port->gpid;
+
+	grp_prio = ppa_update_pkt_devqos_priority(txif_phys, dp_port,
+						  mc_args->desc->skb,
+						  p_item->grp.priority);
+
+	qos_attr.portid = pp_args->eg_port;
+	qos_attr.tc = grp_prio;
+#ifdef HAVE_QOS_EXTMARK
+	qos_attr.mark = p_item->grp.qos_mark.extmark;
+#else
+	qos_attr.mark = p_item->grp.qos_mark.mark;
+#endif
+	qos_attr.dst_q_high = -1;
+
+	/* egress qid */
+	if (!ppa_api_get_mapped_queue ||
+	    ppa_api_get_mapped_queue(txif, &qos_attr)) {
+		pr_err("eg_port(%d) get mapped queue err\n", pp_args->eg_port);
+		ppa_free(dp_port);
+		return PPA_FAILURE;
+	}
+	pp_args->dst_q = qos_attr.dst_q_low;
+	pp_args->dst_q_high = qos_attr.dst_q_high;
+
+	/*Set the egress UD parameters */
+	pp_args->ps = dp_port->subif & 0xFFFF; /* VAP bits */
+	/*For wlan stations we need to pass the multicast gpid to the fw for reliable multicast*/
+	if (dp_port->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
+		/* multicast group id bit[0-7] */
+		pp_args->ps |= eg_gid & 0xFF;
+		pp_args->ps |= BIT(15); /* MCF bit */
+
+		/* set the DevQoS bit 24:27 */
+		pp_args->ps |= (grp_prio & 0xF) << 24;
+		/* set the Calss bit 28:31 */
+		pp_args->ps |= (grp_prio & 0xF) << 28;
+	} else if (!(dp_port->alloc_flag & DP_F_ACA)) {
+		/*In case of DC interfaces we dont need Egress flag */
+		/* This field is supposed to carry DevQos for wireless*/
+		/* set the egress flag in the SI UD bit 27 of PS-B */
+		pp_args->ps |= BIT(27);
+	}
+	dbg("set ps:0x%x for dev:%s", pp_args->ps, ppa_get_netif_name(txif));
+	ppa_free(dp_port);
+	return 0;
+}
+
+static int32_t mc_dst_sess_args_prepare(struct pp_sess_create_args *pp_args,
+					struct lgm_mc_args *mc_args,
+					struct mc_session_node *p_item)
+{
+	uint16_t ig_gid = mc_args->groupid;
+	uint8_t ig_dstid = mc_args->dst_idx;
+
+	mc_sess_args_prepare(pp_args);
+
+	/* Fill in the Hash information */
+	pp_args->hash.h1 = mc_args->hwhash.h1;
+	pp_args->hash.h2 = mc_args->hwhash.h2;
+	pp_args->hash.sig = mc_args->hwhash.sig;
+
+	/*************Getting ingress and egress ports***************/
+	pp_args->in_port = mc_args->ig_gpid;
+
+	/*Setup the classification parameters*/
+	/*classification not based on FV: Duplicate packets pass through PPv4*/
+	pp_args->rx = mc_args->desc->rx;
+	pp_args->tx = mc_args->desc->tx;
+	/*End of FV information*/
+
+	/*Classification is based on the Groupid and the dst_index present in the UD0*/
+	pp_args->cls.n_flds = 2;
+	pp_args->cls.fld_data[0] = ig_gid;
+	pp_args->cls.fld_data[1] = ig_dstid;
+
+	set_bit(PP_SESS_FLAG_PS_VALID_BIT, &pp_args->flags);
+
+	pp_args->mcast.grp_idx = ig_gid;
+	pp_args->mcast.dst_idx = ig_dstid;
+	/*Set the session flags */
+	set_bit(PP_SESS_FLAG_MCAST_DST_BIT, &pp_args->flags);
+
+	return mc_dst_sess_egress_set(pp_args, mc_args, p_item);
+}
+
+static int32_t mc_dst_sess_create(uint16_t ig_gid, uint8_t ig_dstid,
+				  struct pp_sess_create_args *pp_args,
+				  uint32_t *session_id)
+{
+	int32_t ret;
+
+	ret = pp_session_create(pp_args, session_id, NULL);
+	if (ret) {
+		PPA_HAL_RTSTATS_INC(mc_dropped_sess);
+		dbg("client session create failed %d for ig_gid:%d ig_dstid:%d\n",
+		    ret, ig_gid, ig_dstid);
+	} else {
+		spin_lock_bh(&g_hal_mc_db_lock);
+		if (mc_db.ig[ig_gid].stream.grp_ip.f_ipv6)
+			PPA_HAL_RTSTATS_INC(curr_mc_ipv6_session);
+		else
+			PPA_HAL_RTSTATS_INC(curr_mc_ipv4_session);
+
+		mc_ig_dst(ig_gid, ig_dstid)->sess_id = *session_id;
+		mc_ig_dst(ig_gid, ig_dstid)->sess_hash.h1 = pp_args->hash.h1;
+		mc_ig_dst(ig_gid, ig_dstid)->sess_hash.h2 = pp_args->hash.h2;
+		spin_unlock_bh(&g_hal_mc_db_lock);
+	}
+	return ret;
+}
+
+static void mc_dst_sess_delete(uint16_t ig_gid, uint8_t ig_dstid)
+{
+	int32_t ret;
+
+	if (!is_valid_session(mc_ig_dst(ig_gid, ig_dstid)->sess_id + 1))
+		return;
+
+	ret = pp_session_delete(mc_ig_dst(ig_gid, ig_dstid)->sess_id, NULL);
+	if (ret) {
+		dbg("client session:%d delete failed %d for ig_gid:%d ig_dstid:%d\n",
+		    mc_ig_dst(ig_gid, ig_dstid)->sess_id, ret, ig_gid, ig_dstid);
+	} else {
+		if (mc_db.ig[ig_gid].stream.grp_ip.f_ipv6)
+			PPA_HAL_RTSTATS_DEC(curr_mc_ipv6_session);
+		else
+			PPA_HAL_RTSTATS_DEC(curr_mc_ipv4_session);
+
+		/*Clear the index in the db*/
+		mc_ig_dst(ig_gid, ig_dstid)->sess_id = ~0;
+		mc_ig_dst(ig_gid, ig_dstid)->sess_hash.h1 = 0;
+		mc_ig_dst(ig_gid, ig_dstid)->sess_hash.h2 = 0;
+	}
+}
+
 static int mcdev_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	consume_skb(skb);
@@ -940,9 +1459,9 @@ int32_t mc_dp_rx_handler(struct net_device *rxif, struct net_device *txif,
 	}
 
 	spin_lock_bh(&g_hal_mc_db_lock);
-	if (((groupid > 0) && (groupid < MAX_MC_GROUP_ENTRIES)) && mc_db[groupid].used
-		&& ((dev_idx >= 0) && (dev_idx < MAX_MC_CLIENT_PER_GRP))) {
-			tx_netif = mc_db[groupid].dst[dev_idx].netdev;
+	if (mc_ig_dstid_is_exist(groupid, dev_idx)) {
+		tx_netif = mc_ig_dst(groupid, dev_idx)->eg.netdev;
+		groupid = mc_gid_map_ig_to_eg(groupid, dev_idx);
 	}
 	spin_unlock_bh(&g_hal_mc_db_lock);
 
@@ -3215,6 +3734,78 @@ __out_free:
 }
 #endif /*CONFIG_PPA_BBF247_MODE1*/
 
+static int proc_read_ppv4_mcdb(struct seq_file *seq, void *v)
+{
+	uint16_t ig_gid, eg_gid;
+	uint8_t ig_dstid, eg_dstid;
+	bool first_time_outer, first_time_inner;
+
+	if (!capable(CAP_SYSLOG)) {
+		pr_err("Read Permission denied\n");
+		return 0;
+	}
+
+	seq_puts(seq, " +--------+-------------+--------+--------+----------------------+-------------+\n");
+	seq_puts(seq, " | IG GID | GRP SESSION | IG IDX | EG GID | IDX: DST             | DST SESSION |\n");
+	seq_puts(seq, " +--------+-------------+--------+--------+----------------------+-------------+\n");
+	spin_lock_bh(&g_hal_mc_db_lock);
+	for_each_set_bit(ig_gid, mc_db.ig_gid_bitmap, MAX_MC_GROUP_ENTRIES) {
+		if (ig_gid == 0)
+			continue;
+
+		first_time_outer = true;
+		seq_printf(seq, " |  %4d  | %-11d ", ig_gid, mc_db.ig[ig_gid].sess_id);
+		for_each_set_bit(eg_gid, mc_db.eg_gid_bitmap, MAX_MC_GROUP_ENTRIES) {
+			if (mc_db.eg[eg_gid].ig_gid != ig_gid)
+				continue;
+
+			if (first_time_outer) {
+				first_time_outer = false;
+			} else {
+				seq_puts(seq, " |        +             +--------+--------+----------------------+-------------+\n");
+				seq_puts(seq, " |        |             ");
+			}
+			first_time_inner = true;
+			for_each_eg_dst(eg_gid, eg_dstid) {
+				ig_dstid = mc_dstid_map_eg_to_ig(eg_gid, eg_dstid);
+				if (first_time_inner) {
+					seq_printf(seq, "|  %4d  |  %4d  ", ig_dstid, eg_gid);
+					first_time_inner = false;
+				} else {
+					seq_puts(seq, " |        +             +--------+        +----------------------+-------------+\n");
+					seq_printf(seq, " |        |             |  %4d  |        ",
+						   ig_dstid);
+				}
+				seq_printf(seq, "| %3d: %-15s | %-11d |\n",
+					   eg_dstid,
+					   mc_ig_dst(ig_gid, ig_dstid)->eg.netdev->name,
+					   mc_ig_dst(ig_gid, ig_dstid)->sess_id);
+			}
+			if (first_time_inner)
+				seq_printf(seq, "|    NA  |  %4d  | NA                   | NA          |\n",
+					   eg_gid);
+		}
+		if (first_time_outer)
+			seq_puts(seq, "|    NA  |    NA  | NA                   | NA          |\n");
+		seq_puts(seq, " +--------+-------------+--------+--------+----------------------+-------------+\n");
+	}
+	spin_unlock_bh(&g_hal_mc_db_lock);
+	return 0;
+}
+
+static int proc_read_ppv4_mcdb_seq_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, proc_read_ppv4_mcdb, NULL);
+}
+
+static const struct file_operations dbgfs_file_ppv4_mcdb_seq_fops = {
+	.owner		= THIS_MODULE,
+	.open		= proc_read_ppv4_mcdb_seq_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static struct ppa_debugfs_files lgm_hal_debugfs_files[] = {
 	{ "accel",            0600, &dbgfs_file_ppv4_accel_seq_fops },
 #if IS_ENABLED(CONFIG_INTEL_VPN) || IS_ENABLED(CONFIG_MXL_VPN)
@@ -3228,6 +3819,7 @@ static struct ppa_debugfs_files lgm_hal_debugfs_files[] = {
 	{ "bbf247_hgu_model", 0600, &dbgfs_file_ppv4_bbf247_hgu_seq_fops },
 #endif
 	{ "supp-accel",       0600, &dbgfs_file_ppv4_support_accel_seq_fops },
+	{ "mc_db",            0600, &dbgfs_file_ppv4_mcdb_seq_fops },
 };
 
 static struct ppa_debugfs_files pphal_fbm_debugfs_files[] = {
@@ -3328,23 +3920,12 @@ static int pp_hal_sgc_alloc(PPA_NETIF *dev, struct sgc_info *sgc, int count)
 		sgc[1].grp = PP_SGC_LVL_3;
 	}
 #else
-	if (ppa_check_is_ppp_netif(dev) ||
-	    ppa_is_gre_netif(dev)) {
+	if (ppa_dev_is_br(dev)) {
 		sgc[0].grp = PP_SGC_LVL_4;
-		sgc[1].grp = PP_SGC_LVL_5;
-	} else if (netif_is_macvlan(dev) ||
-		   ppa_dev_is_br(dev)) {
-		sgc[0].grp = PP_SGC_LVL_5;
 		sgc[1].grp = PP_SGC_LVL_6;
-	} else if (is_vlan_dev(dev)) {
-		sgc[0].grp = PP_SGC_LVL_6;
-		sgc[1].grp = PP_SGC_LVL_5;
-	} else if (ppa_is_netif_bridged(dev)) {
-		sgc[0].grp = PP_SGC_LVL_3;
-		sgc[1].grp = PP_SGC_LVL_2;
 	} else {
-		sgc[0].grp = PP_SGC_LVL_2;
-		sgc[1].grp = PP_SGC_LVL_3;
+		sgc[0].grp = PP_SGC_LVL_3;
+		sgc[1].grp = PP_SGC_LVL_5;
 	}
 #endif /* DOCSIS_SUPPORT */
 
@@ -3353,13 +3934,12 @@ static int pp_hal_sgc_alloc(PPA_NETIF *dev, struct sgc_info *sgc, int count)
 		cntr[0] = cntr[1] = PP_SGC_INVALID;
 		ret = pp_sgc_alloc(owner, sgc[i].grp, cntr, 2);
 		if (unlikely(ret)) {
-			dbg("<%s:%d> pp_sgc_alloc() failed for group:%u\n",
-			    __func__, __LINE__, sgc[i].grp);
+			dbg("pp_sgc_alloc() failed for group:%u\n", sgc[i].grp);
 		}
 		sgc[i].rx_id = cntr[0];
 		sgc[i].tx_id = cntr[1];
 	}
-
+	dbg("%s allocated sgc rx_id %d tx_id %d\n", dev->name, sgc[i].rx_id, sgc[i].tx_id);
 	return ret;
 }
 
@@ -3568,7 +4148,7 @@ static int test_and_attach_sgc(uint16_t sgc[PP_SI_SGC_MAX],
 
 		return PPA_SUCCESS;
 	}
-
+	dbg("failed to attach SGC group for %s", ifinfo->dev->name);
 	return PPA_FAILURE;
 }
 
@@ -3648,83 +4228,6 @@ static void detach_sgc(PPA_NETIF *rxif, PPA_NETIF *txif)
  *		 Global Function
  * ####################################
  */
-
-/*!
-	\fn uint32_t get_hal_id(uint32_t *p_family,
-			uint32_t *p_type,
-			uint32_t *p_if,
-			uint32_t *p_mode,
-			uint32_t *p_major,
-			uint32_t *p_mid,
-			uint32_t *p_minor)
-			char *name,
-			char *version)
-	\ingroup PPA_lgm_pp_hal_GLOBAL_FUNCTIONS
-	\brief read HAL ID
-	\param p_family	get family code
-	\param p_type	get driver type
-	\param p_if	get interface type
-	\param p_mode	get driver mode
-	\param p_major	get major number
-	\param p_mid	get mid number
-	\param p_minor	get minor number
-	\return no return value
- */
-void get_lgm_pp_hal_id(uint32_t *p_family,
-			uint32_t *p_type,
-			uint32_t *p_if,
-			uint32_t *p_mode,
-			uint32_t *p_major,
-			uint32_t *p_mid,
-			uint32_t *p_minor)
-{
-	if ( p_family )
-		*p_family = VER_FAMILY;
-
-	if ( p_type )
-		*p_type = VER_DRTYPE;
-
-	if ( p_if )
-		*p_if = VER_INTERFACE;
-
-	if ( p_mode )
-		*p_mode = VER_ACCMODE;
-
-	if ( p_major )
-		*p_major = VER_MAJOR;
-
-	if ( p_mid )
-		*p_mid = VER_MID;
-
-	if ( p_minor )
-		*p_minor = VER_MINOR;
-}
-
-/*!
-	\fn uint32_t get_firmware_id(uint32_t *id,
-					 char *name,
-					 char *version)
-	\ingroup PPA_lgm_pp_hal_GLOBAL_FUNCTIONS
-	\brief read firmware ID
-	\param p_family	 get family code
-	\param p_type	 get firmware type
-	\return no return value
- */
-int32_t get_firmware_id(uint32_t *id,
-				char *p_name,
-				char *p_version)
-{
-	/* TBD */
-	/* Get the firmware version from PPv4 */
-
-	/*
-	*id=sw_version.nId;
-	ppa_memcpy(p_name,sw_version.cName, PPA_VERSION_LEN);
-	ppa_memcpy(p_version,sw_version.cVersion, PPA_VERSION_LEN);
-	*/
-
-	return PPA_SUCCESS;
-}
 
 /*!
 	\fn uint32_t get_number_of_phys_port(void)
@@ -3884,7 +4387,7 @@ static uint32_t ppa_update_pkt_devqos_priority(PPA_NETIF *dev, PPA_SUBIF *subif,
 	    !ppa_update_pkt_devqos_priority_hook(dev, subif, skb))
 		new_prio = ppa_get_pkt_priority(skb);
 
-	dbg("dev:%s skbprio:%d changed to devqos:%d\n", dev->name, prio, new_prio);
+	dbg("dev:%s skbprio:%d changed to devqos:%d", dev->name, prio, new_prio);
 	return new_prio;
 }
 
@@ -4202,6 +4705,83 @@ int32_t add_supportive_hw_route_entry(PPA_ROUTING_INFO *route)
 	return PPA_SUCCESS;
 }
 
+static void enable_syncq_for_docsis(struct uc_session_node *p_item,
+				    PPA_SUBIF *dp_port, struct pktprs_desc *desc,
+				    struct pp_sess_create_args *rt_entry)
+{
+	PPA_SUBIF *rx_port;
+	PPA_NETIF *rx_if;
+
+	if (p_item->flag2 & SESSION_FLAG2_CPU_BOUND) {
+		dbg("sync-q not supported for cpu-bound traffic\n");
+		return;
+	}
+
+	if (!desc || !desc->rx || !p_item->rx_if || !desc->rx->ifindex) {
+		dbg("Invalid rx info\n");
+		return;
+	}
+
+	rx_port = ppa_malloc(sizeof(PPA_SUBIF));
+	if (!rx_port) {
+		pr_err("[%s:%d] rx_port allocation failed!\n", __func__,
+			__LINE__);
+		return;
+	}
+
+	/* get base interface from desc ifindex */
+	rx_if = ppa_dev_get_by_index(desc->rx->ifindex);
+	if (!rx_if) {
+		dbg("Invalid base rx_if for interface %s\n", p_item->rx_if->name);
+		goto free;
+	}
+	ppa_put_netif(rx_if);
+
+	ppa_memset(rx_port, 0, sizeof(PPA_SUBIF));
+	if (dp_get_netif_subifid(rx_if, NULL, NULL, NULL, rx_port, 0)) {
+		dbg("dp_get_netif_subifid failed for [%s]\n", rx_if->name);
+		goto free;
+	}
+
+	/* enable syncq for UDP only for docsis */
+	if ((p_item->pkt.ip_proto == PPA_IPPROTO_UDP) &&
+	    ((dp_port->alloc_flag & DP_F_DOCSIS) ||
+	     (rx_port->alloc_flag & DP_F_DOCSIS)))
+		set_bit(PP_SESS_FLAG_SYNCQ_BIT, &rt_entry->flags);
+
+free:
+	ppa_free(rx_port);
+}
+
+static void check_aqm_lld_for_docsis(PPA_SUBIF *dp_port,
+	struct pp_sess_create_args *rt_entry)
+{
+	struct pp_qos_aqm_lld_sf_config sf_cfg = {0};
+	u16 sf_indx;
+	int32_t ret = 0;
+
+	/* lld apply on US packet - egress port is docsis */
+	if (!(dp_port->alloc_flag & DP_F_DOCSIS))
+		return;
+
+	ret = pp_misc_get_sf_indx_by_q(rt_entry->dst_q, &sf_indx);
+	if (ret) {
+		dbg("failed to get sf for queue %u\n", rt_entry->dst_q);
+		return;
+	}
+
+	ret = pp_misc_sf_conf_get(sf_indx, &sf_cfg);
+	if (ret) {
+		dbg("failed to get sf configuration for sf_id %u\n", sf_indx);
+		return;
+	}
+
+	if (sf_cfg.llsf)
+		set_bit(PP_SESS_FLAG_LLD_BIT, &rt_entry->flags);
+	else if (sf_cfg.aqm_mode == PP_QOS_AQM_MODE_NORMAL)
+		set_bit(PP_SESS_FLAG_AQM_BIT, &rt_entry->flags);
+}
+
 /*!
 	\fn int32_t add_routing_entry(PPA_ROUTING_INFO *route_info)
 	\ingroup PPA_lgm_pp_hal_GLOBAL_FUNCTIONS
@@ -4370,9 +4950,7 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 				if (p_item->flags & SESSION_IS_TCP) {
 					/*Set the session flags */
 					if (is_hw_litepath_enabled()) {
-						/* Soft LRO applicable only for C0 platforms */
-						if (get_soc_rev() == CQM_LGM_C)
-							set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
+						set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
 					}
 					lro_entry.lro_type = LRO_TYPE_TCP;
 					/*check mptcp options and if yes set
@@ -4565,7 +5143,7 @@ non_lro_ppv4_session:
 					ppa_free(dp_port_vuni);
 				} else if (dp_port->alloc_flag & DP_F_DOCSIS) {
 					set_bit(PP_SESS_FLAG_DOCSIS_BIT, &rt_entry.flags);
-					rt_entry.ps =  desc->skb->DW0;
+					rt_entry.ps = desc->skb->DW0;
 					dbg("[Docsis] rt_entry.eg_port %d",
 						rt_entry.eg_port);
 				} else {
@@ -4681,8 +5259,14 @@ non_lro_ppv4_session:
 	}
 #endif /* CONFIG_INTEL_VPN || CONFIG_MXL_VPN */
 
+	enable_syncq_for_docsis(p_item, dp_port, desc, &rt_entry);
+
 	dbg("ig_gpid=%d eg_port=%d eg_gpid=%d, rt_entry.dst_q=%d\n",
 		rt_entry.in_port, dp_port->port_id, rt_entry.eg_port, rt_entry.dst_q);
+
+	/* check if session should be marked as aqm or lld */
+	check_aqm_lld_for_docsis(dp_port, &rt_entry);
+
 	ppa_free(dp_port);
 
 	if (ppa_tdox_enable_get()                      && /* tdox enabled */
@@ -4803,6 +5387,17 @@ non_lro_ppv4_session:
 					}
 				}
 				refcount_set(&pp_hal_db[session_id].lp_rxinfo->refcnt, 1);
+
+				pp_hal_db[session_id].stats = 
+					(struct pp_stats *)ppa_malloc(sizeof(struct pp_stats));
+				if (pp_hal_db[session_id].stats) {
+					ppa_memset(pp_hal_db[session_id].stats,
+						   0, sizeof(struct pp_stats));
+				} else {
+					pr_err("[%s:%d] stats alloc failure!\n", __func__, __LINE__);
+					spin_unlock_bh(&g_hal_db_lock);
+					return PPA_FAILURE;
+				}
 			} else {
 				pr_err("[%s:%d] lp_rxinfo alloc failure!\n", __func__, __LINE__);
 			}
@@ -4825,6 +5420,7 @@ non_lro_ppv4_session:
 int32_t del_routing_entry(PPA_ROUTING_INFO *route)
 {
 	int32_t ret = 0;
+	struct pp_stats *stats = NULL;
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
 	struct lp_info *lp_rxinfo = NULL;
 #endif
@@ -4873,6 +5469,9 @@ int32_t del_routing_entry(PPA_ROUTING_INFO *route)
 			if (lp_rxinfo)
 				lp_rxinfo_put(lp_rxinfo);
 #endif /*IS_ENABLED(LITEPATH_HW_OFFLOAD)*/
+			stats = pp_hal_db[p_item->routing_entry].stats;
+			if (stats)
+				ppa_free(stats);
 			ppa_memset(&pp_hal_db[p_item->routing_entry],0,sizeof(PP_HAL_DB_NODE));
 			spin_unlock_bh(&g_hal_db_lock);
 			detach_sgc(p_item->rx_if, p_item->tx_if);
@@ -4902,53 +5501,32 @@ int32_t del_routing_entry(PPA_ROUTING_INFO *route)
  */
 int32_t del_wan_mc_entry(PPA_MC_INFO *mc_route)
 {
-	int32_t ret = 0, i;
+	int32_t ret = PPA_SUCCESS;
+	uint16_t eg_gid;
+	uint8_t eg_dstid;
+	struct mc_session_node *p_item;
 
-	if (mc_route->p_item) {
-		struct mc_session_node *p_item = (struct mc_session_node *)mc_route->p_item;
+	p_item = (struct mc_session_node *)mc_route->p_item;
+	if (!p_item)
+		return PPA_FAILURE;
 
-		spin_lock_bh(&g_hal_mc_db_lock);
-		if (mc_db[p_item->grp.group_id].used) {
-			/*1. Delete the multicast Mc session */
-			for (i = 0; i < MAX_MC_CLIENT_PER_GRP; i++) {
-				if (is_valid_session(mc_db[p_item->grp.group_id].dst[i].sess_id)) {
-					/*1. Delete all the group member PPv4sessions*/
-					/* session_id always stored +1 to handle valid sessionid 0*/
-					if ((ret = pp_session_delete(mc_db[p_item->grp.group_id].dst[i].sess_id - 1, NULL))) {
-						dbg("pp_session delete multicast client session returned Error:%d\n", ret);
-					}
-				}
-				/*If the interface bitmask is set have to remove the uC entry */
-				if (p_item->grp.if_mask & (1 << i)) {
-					/* 2.Reset the bit in uC multicast group*/
-					if ((ret = pp_mcast_dst_set(p_item->grp.group_id, i, PPA_IF_DEL))) {
-						dbg("pp_mcast_dst_set returned Error:%d\n", ret);
-					}
-				}
-			}
+	eg_gid = p_item->grp.group_id;
+	spin_lock_bh(&g_hal_mc_db_lock);
+	if (mc_eg_gid_is_exist(eg_gid)) {
+		dbg("deleting eg_gid:%d w/ drop flag %d",
+		    eg_gid, !!(p_item->flags & SESSION_DROP));
+		for_each_eg_dst(eg_gid, eg_dstid)
+			mc_eg_dstid_remove(eg_gid, eg_dstid);
 
-			/* 3.Clear the hal db entry */
-			ppa_memset(&mc_db[p_item->grp.group_id], 0, sizeof(MC_DB_NODE));
-			/* Clear the HW flag */
+		if (!(p_item->flags & SESSION_DROP)) {
+			mc_eg_gid_remove(eg_gid);
+			dbg("deleted eg_gid:%d w/ drop flag 0\n", eg_gid);
+
+			p_item->mc_entry = mc_route->p_entry = ~0;
 			p_item->flags &= ~SESSION_ADDED_IN_HW;
-
-			/*If the session is not a DROP session */
-			if (!(p_item->flags & SESSION_DROP)) {
-				/*4. Delete the multicast group PPv4 session*/
-				if (is_valid_session(mc_route->p_entry)) {
-					if ((ret = pp_session_delete(mc_route->p_entry - 1, NULL))) {
-						dbg("pp_session delete multicast group session returned Error:%d\n", ret);
-					}
-					if (!p_item->grp.sess_info->ip_mc_group.f_ipv6)
-						PPA_HAL_RTSTATS_DEC(curr_mc_ipv4_session);
-					else
-						PPA_HAL_RTSTATS_DEC(curr_mc_ipv6_session);
-					p_item->mc_entry = mc_route->p_entry = 0;
-				}
-			}
 		}
-		spin_unlock_bh(&g_hal_mc_db_lock);
 	}
+	spin_unlock_bh(&g_hal_mc_db_lock);
 
 	return ret;
 }
@@ -4961,348 +5539,171 @@ int32_t update_wan_mc_entry(PPA_MC_INFO *mc_route)
 {
 	struct pp_sess_create_args pp_args = {0};
 	struct lgm_mc_args *mc_args = NULL;
-	uint32_t session_id = 0, dev_idx = 0;
-	PPA_SUBIF *dp_port;
-	int32_t ret = PPA_FAILURE, i = 0;
-	struct netdev_attr qos_attr = {0};
-	uint32_t skb_prio;
+	uint32_t session_id = 0;
+	int32_t ret = PPA_FAILURE;
+	uint16_t ig_gid, eg_gid;
+	uint8_t ig_dstid;
+	struct mc_session_node *p_item;
 
-	struct mc_session_node *p_item = (struct mc_session_node *)mc_route->p_item;
+	p_item = (struct mc_session_node *)mc_route->p_item;
 	if (!p_item) {
 		dbg("mc_session_node is null!!!\n");
 		return PPA_FAILURE;
 	}
 
-	/*If the call is invoked from the parsing driver p_item->session action will not be NULL*/
+	/* handle multicast signaling */
 	if (!p_item->session_action) {
+		struct eg_ref eg_ref = {0};
+		struct stream_info stream = {0};
 
-		/*Call is invoked from multicast daemon
-		Following actions needs to be invoked
-		1. update the HAL MC DB
-		2. based on the current operation mc_route->cop we need to update the pp uC */
-		if (mc_route->cop) {
-			dev_idx = mc_route->cop->index; /* [valid index 0 -7] */
-			if ((dev_idx >= 0) && (dev_idx < MAX_MC_GROUP_ENTRIES)) {
-				/*Update the bit in uC multicast group*/
-				if ((ret = pp_mcast_dst_set(p_item->grp.group_id, dev_idx, mc_route->cop->flag))) {
-					dbg("pp_mcast_dst_set returned Error:%d group = %d index = %d op = %d\n",
-						ret, p_item->grp.group_id, dev_idx, mc_route->cop->flag);
-				} else {
-					dbg("uC mc %s for group=%d index=%d dev=%s\n, "
-						, (mc_route->cop->flag ? "set" : "reset"), p_item->grp.group_id, dev_idx,
-						p_item->grp.txif[dev_idx].netif->name);
-				/*If the operation is delete we need to delete the correspoinding session from the pp*/
-					if (mc_route->cop->flag == PPA_IF_DEL) {
-						spin_lock_bh(&g_hal_mc_db_lock);
-						if (is_valid_session(mc_db[p_item->grp.group_id].dst[dev_idx].sess_id)) {
-							/*Delete the group member PPv4sessions*/
-							/* session_id always stored +1 to handle valid sessionid 0*/
-							if ((ret = pp_session_delete(
-								mc_db[p_item->grp.group_id].dst[dev_idx].sess_id - 1, NULL))) {
-								dbg("pp_session delete multicast client session %d returned Error:%d\n",
-									mc_db[p_item->grp.group_id].dst[dev_idx].sess_id - 1, ret);
-							}
-							dbg("pp_session delete multicast client session %d succeeded\n",
-								mc_db[p_item->grp.group_id].dst[dev_idx].sess_id - 1);
-							/*Clear the index in the db*/
-							ppa_memset(&mc_db[p_item->grp.group_id].dst[dev_idx],
-								0, sizeof(struct client_info));
-						}
-						spin_unlock_bh(&g_hal_mc_db_lock);
-					} else {
-						/* Set egress netdevice for the client in the DB */
-						spin_lock_bh(&g_hal_mc_db_lock);
-						mc_db[p_item->grp.group_id].dst[dev_idx].netdev
-							= p_item->grp.txif[dev_idx].netif;
-						spin_unlock_bh(&g_hal_mc_db_lock);
-						p_item->flags |= SESSION_ADDED_IN_HW;
-					}
-				}
-			}
-		} else {
-			/*operation not specified nothing needs to be done */
-			dbg("Multicast operation not specified !!!\n");
+		if (!mc_route->cop) {
+			dbg("multicast ops not specified!\n");
+			return PPA_FAILURE;
 		}
+
+		eg_ref.gid = p_item->grp.group_id;
+		eg_ref.dstid = mc_route->cop->index; /* [valid index 0 -7] */
+		eg_ref.netdev = p_item->grp.txif[eg_ref.dstid].netif;
+
+		spin_lock_bh(&g_hal_mc_db_lock);
+		if (mc_route->cop->flag == PPA_IF_DEL) {
+			dbg("removing dev for eg_gid:%d eg_dstid:%d",
+			    eg_ref.gid, eg_ref.dstid);
+			mc_eg_dstid_remove(eg_ref.gid, eg_ref.dstid);
+			ret = PPA_SUCCESS;
+			dbg("removed dev for eg_gid:%d eg_dstid:%d\n",
+			    eg_ref.gid, eg_ref.dstid);
+		} else {
+			dbg("adding dev:%s for eg_gid:%d eg_dstid:%d",
+			    eg_ref.netdev->name, eg_ref.gid, eg_ref.dstid);
+			memcpy(&stream.grp_ip,
+			       &p_item->grp.sess_info->ip_mc_group, sizeof(IP_ADDR_C));
+			memcpy(&stream.src_ip,
+			       &p_item->grp.sess_info->source_ip, sizeof(IP_ADDR_C));
+			stream.rxdev = p_item->grp.src_netif;
+
+			ret = mc_eg_dstid_add(&eg_ref, &stream);
+			if (!ret) {
+				dbg("added dev:%s for eg_gid:%d eg_dstid:%d\n",
+				    eg_ref.netdev->name, eg_ref.gid, eg_ref.dstid);
+				p_item->flags |= SESSION_ADDED_IN_HW;
+			}
+		}
+		spin_unlock_bh(&g_hal_mc_db_lock);
 		return ret;
 	}
 
-	/*IF the control reaches here the call is invoked from the parsing driver */
-	mc_args = (struct lgm_mc_args *) p_item->session_action;
+	/* here the call is invoked from the parsing driver */
+	mc_args = (struct lgm_mc_args *)p_item->session_action;
 	if (mc_args && !mc_args->desc) {
-		dbg("pktprs descriptor is null!!!\n");
+		dbg("pktprs descriptor is null!\n");
 		return PPA_FAILURE;
 	}
 
 	if (!mc_args->ig_gpid) {
-		dbg("Session ingress gpid is not valid\n");
+		dbg("session ingress gpid is not valid!\n");
 		return PPA_FAILURE;
 	}
 
-	memset(&pp_args, 0, sizeof(pp_args));
-
-	pp_args.color = PP_COLOR_GREEN;
-	/* Fill in the Hash information */
-	pp_args.hash.h1 = mc_args->hwhash.h1;
-	pp_args.hash.h2 = mc_args->hwhash.h2;
-	pp_args.hash.sig = mc_args->hwhash.sig;
-
-	/*TBD:Set the session group counters */
-	for (i = 0; i < ARRAY_SIZE(pp_args.sgc); i++)
-		pp_args.sgc[i] = PP_SGC_INVALID;
-	/*TBD: Set the token bucket metering */
-	for (i = 0; i < ARRAY_SIZE(pp_args.tbm); i++)
-		pp_args.tbm[i] = PP_TBM_INVALID;
-	/*End TBD Set*/
-
-	/*************Getting ingress and egress ports***************/
-	pp_args.in_port = mc_args->ig_gpid;
-
-	/*Compare the ingress gpid with the multicast GPID; which is stored*/
-	/*if the gpids match this is session for a specific destination.*/
-	if (pp_args.in_port == g_mcast_nf.gpid) {
-		/* Find the tx netdevice */
-		if (p_item->grp.group_id == mc_args->groupid &&
-			((p_item->grp.if_mask >> (mc_args->dst_idx)) & 1)) {
-
-			dev_idx = mc_args->dst_idx; /* [valid value returned is [0-15] */
-			if ((dev_idx >= 0) && dev_idx < MAX_MC_CLIENT_PER_GRP) {
-				/* if session already exists return */
-				spin_lock_bh(&g_hal_mc_db_lock);
-				if (is_valid_session(mc_db[p_item->grp.group_id].dst[dev_idx].sess_id)) {
-					/*Session exists but Add request is coming again
-					we need to compare the HASH and if it is not matching delete the session*/
-					if ((mc_db[p_item->grp.group_id].dst[dev_idx].sess_hash.h1
-						!= mc_args->hwhash.h1) ||
-						(mc_db[p_item->grp.group_id].dst[dev_idx].sess_hash.h2
-						!= mc_args->hwhash.h2)) {
-						/*Delete the group member PPv4sessions*/
-						/* session_id always stored +1 to handle valid sessionid 0*/
-						if ((ret = pp_session_delete(
-							mc_db[p_item->grp.group_id].dst[dev_idx].sess_id - 1, NULL))) {
-							dbg("pp_session delete multicast dst sess%d ret Error:%d\n",
-								mc_db[p_item->grp.group_id].dst[dev_idx].sess_id - 1, ret);
-						}
-
-						/*Clear the index in the db*/
-						mc_db[p_item->grp.group_id].dst[dev_idx].sess_id = 0;
-						mc_db[p_item->grp.group_id].dst[dev_idx].sess_hash.h1 = 0;
-						mc_db[p_item->grp.group_id].dst[dev_idx].sess_hash.h2 = 0;
-						dbg("deleted client session at index =%d\n", dev_idx);
-					} else {
-						dbg("A client session exists for group=%d at index=%d\n",
-							p_item->grp.group_id, dev_idx);
-					}
-					spin_unlock_bh(&g_hal_mc_db_lock);
-					return PPA_SUCCESS;
-				}
-				spin_unlock_bh(&g_hal_mc_db_lock);
-
-				dp_port = ppa_malloc(sizeof(PPA_SUBIF));
-				if (!dp_port) {
-					dbg("[%s:%d] DP subif allocation failed!!!\n",
-						__func__, __LINE__);
-					return PPA_ENOMEM;
-				}
-				ppa_memset(dp_port, 0, sizeof(PPA_SUBIF));
-
-				skb_prio = p_item->grp.priority;
-				if (p_item->grp.txif[dev_idx].netif) {
-					PPA_NETIF *txif = p_item->grp.txif[dev_idx].netif;
-
-					/* get physical device for any logical destination member */
-					if (txif->ifindex != mc_args->desc->tx->ifindex) {
-						txif = ppa_dev_get_by_index(mc_args->desc->tx->ifindex);
-						ppa_put_netif(txif);
-					}
-
-					/*************Get the egress gpid from the tx netdevice******/
-					if (dp_get_netif_subifid(txif,
-						NULL, NULL, NULL, dp_port, 0)){
-
-						dbg("Unable to get tx netdevice GPID!!!\n");
-						ppa_free(dp_port);
-						return PPA_FAILURE;
-					}
-
-					skb_prio = ppa_update_pkt_devqos_priority(
-							txif,
-							dp_port,
-							mc_args->desc->skb,
-							p_item->grp.priority);
-
-					/* egress gpid */
-					pp_args.eg_port = dp_port->gpid;
-					qos_attr.portid = pp_args.eg_port;
-					qos_attr.tc = skb_prio;
-					qos_attr.dst_q_high = -1;
-#ifdef HAVE_QOS_EXTMARK
-					qos_attr.mark = p_item->grp.qos_mark.extmark;
-#else
-					qos_attr.mark = p_item->grp.qos_mark.mark;
-#endif
-					/* egress qid */
-					if (ppa_api_get_mapped_queue) {
-						if (ppa_api_get_mapped_queue(
-						    p_item->grp.txif[dev_idx].netif,
-						    &qos_attr))
-							return PPA_FAILURE;
-					} else {
-						pr_err("eg_port(%d) get mapped queue err\n", pp_args.eg_port);
-						return PPA_FAILURE;
-					}
-					pp_args.dst_q = qos_attr.dst_q_low;
-					dbg("dst_dev=%s\n", p_item->grp.txif[dev_idx].netif->name);
-					/************************************************************/
-				}
-
-				/*Setup the classification parameters*/
-				/*classification not based on FV: Duplicate packets pass through PPv4*/
-				pp_args.rx = mc_args->desc->rx;
-				pp_args.tx = mc_args->desc->tx;
-				/*End of FV information*/
-
-				/*Classification is based on the Groupid and the dst_index present in the UD0*/
-				pp_args.cls.n_flds = 2;
-				pp_args.cls.fld_data[0] = mc_args->groupid;
-				pp_args.cls.fld_data[1] = mc_args->dst_idx;
-
-				/*Set the egress UD parameters */
-				pp_args.ps = dp_port->subif & 0xFFFF; /* VAP bits */
-				/*For wlan stations we need to pass the multicast gpid to the fw for reliable multicast*/
-				if ((p_item->grp.txif[dev_idx].if_flags & NETIF_DIRECTCONNECT_WIFI)) {
-					/* multicast group id bit[0-7] */
-					pp_args.ps |= p_item->grp.group_id & 0xFF;
-					pp_args.ps |= BIT(15); /* MCF bit */
-
-					/* set the DevQoS bit 24:27 */
-					pp_args.ps |= (skb_prio & 0xF) << 24;
-					/* set the Calss bit 28:31 */
-					pp_args.ps |= (skb_prio & 0xF) << 28;
-					dbg("dev:%s qosprio:%d ps:0x%x\n",
-					    ppa_get_netif_name(p_item->grp.txif[dev_idx].netif),
-					    skb_prio, pp_args.ps);
-				}
-
-				if (!(dp_port->alloc_flag & DP_F_ACA)) {
-					/*In case of DC interfaces we dont need Egress flag */
-					/* This field is supposed to carry DevQos for wireless*/
-					/* set the egress flag in the SI UD bit 27 of PS-B */
-					pp_args.ps |= BIT(27);
-				}
-				ppa_free(dp_port);
-
-				set_bit(PP_SESS_FLAG_PS_VALID_BIT, &pp_args.flags);
-
-				pp_args.mcast.grp_idx = p_item->grp.group_id;
-				pp_args.mcast.dst_idx = mc_args->dst_idx;
-				/*Set the session flags */
-				set_bit(PP_SESS_FLAG_MCAST_DST_BIT, &pp_args.flags);
-
-				/*add hardware session */
-				if ((ret = pp_session_create(&pp_args, &session_id, NULL))) {
-					dbg("pp_session_create returned failure!! %s %d ret=%d\n", __FUNCTION__, __LINE__, ret);
-				} else {
-					/* store session_id against the corresponding dev_idx in the hal mc db */
-					if (is_valid_session(session_id + 1)) {
-						spin_lock_bh(&g_hal_mc_db_lock);
-						/*always stored +1 to handle index 0*/
-						mc_db[p_item->grp.group_id].dst[dev_idx].sess_id = session_id + 1;
-						mc_db[p_item->grp.group_id].dst[dev_idx].sess_hash.h1 = mc_args->hwhash.h1;
-						mc_db[p_item->grp.group_id].dst[dev_idx].sess_hash.h2 = mc_args->hwhash.h2;
-						spin_unlock_bh(&g_hal_mc_db_lock);
-						dbg("Added client session for index=%d session_id=%d\n",dev_idx, session_id + 1);
-					}
-				}
-			}
-		} else {
-			dbg("Device index %d not valid for multicast group %d\n", dev_idx, mc_args->groupid);
-		}
-	} else if (!p_item->mc_entry) {
-		/*It is multicast group session*/
-		/* In case of multicast group session the egress gpid must be set as ingress gpid for the uC to identify correct IGP*/
-		/*pp_args.eg_port = mc_args->ig_gpid;*/
-		pp_args.eg_port = g_mcast_nf.gpid;
-
-		/*egress qid static qid allocated during mc NF creation*/
-		pp_args.dst_q = g_mcast_nf.qid;
-
-		/* group session should not insert any destination member protocol */
-		if (p_item->flags & SESSION_VALID_VLAN_INS)
-			pktprs_proto_remove(mc_args->desc->tx, PKTPRS_PROTO_VLAN0, PKTPRS_HDR_LEVEL0);
-
-		/*Filling in the FV information*/
-		pp_args.rx = mc_args->desc->rx;
-		pp_args.tx = mc_args->desc->tx;
-		/*End of FV information*/
-
-		/* multicast group id bit[0-8] */
-		pp_args.ps = p_item->grp.group_id & 0x1FF;
-
-		/* multicast NF subif id [15:9]*/
-		pp_args.ps |= (g_mcast_nf.subif & 0x7F) << 9;
-
-		set_bit(PP_SESS_FLAG_PS_VALID_BIT, &pp_args.flags);
-
-		pp_args.mcast.grp_idx = p_item->grp.group_id;
-		/*Set the session flags */
-		set_bit(PP_SESS_FLAG_MCAST_GRP_BIT, &pp_args.flags);
-
-		/*add hardware session */
-		if ((ret = pp_session_create(&pp_args, &session_id, NULL))) {
-			dbg("pp_session_create returned failure!! %s %d ret=%d\n", __FUNCTION__, __LINE__, ret);
-			PPA_HAL_RTSTATS_INC(mc_dropped_sess);
-		} else {
-			/* Multicast group session */
-			if (is_valid_session(session_id + 1)) {
-				/*always stored +1 to handle index 0*/
-				mc_route->p_entry = p_item->mc_entry = session_id + 1;
-				spin_lock_bh(&g_hal_mc_db_lock);
-				mc_db[p_item->grp.group_id].used = 1;
-				mc_db[p_item->grp.group_id].grp_sess_hash.h1 = mc_args->hwhash.h1;
-				mc_db[p_item->grp.group_id].grp_sess_hash.h2 = mc_args->hwhash.h2;
-				spin_unlock_bh(&g_hal_mc_db_lock);
-				dbg("Added group session session_id=%d\n", session_id + 1);
-				if (!p_item->grp.sess_info->ip_mc_group.f_ipv6)
-					PPA_HAL_RTSTATS_INC(curr_mc_ipv4_session);
-				else
-					PPA_HAL_RTSTATS_INC(curr_mc_ipv6_session);
-			}
-		}
-	} else {
-	/*If the session exists and hw ahsh is not matching.. delete the session*/
-		spin_lock_bh(&g_hal_mc_db_lock);
-		if (mc_db[p_item->grp.group_id].used
-			&& ((mc_db[p_item->grp.group_id].grp_sess_hash.h1
-			!= mc_args->hwhash.h1) ||
-			(mc_db[p_item->grp.group_id].grp_sess_hash.h2
-			!= mc_args->hwhash.h2))) {
-			/* delete all the dst sessions */
-			for (i = 0; i < MAX_MC_CLIENT_PER_GRP; i++) {
-				if (is_valid_session(mc_db[p_item->grp.group_id].dst[i].sess_id)) {
-					/*1. Delete all the group member PPv4sessions*/
-					/* session_id always stored +1 to handle valid sessionid 0*/
-					if ((ret = pp_session_delete(mc_db[p_item->grp.group_id].dst[i].sess_id - 1, NULL))) {
-						dbg("pp_session delete multicast client session returned Error:%d\n", ret);
-					}
-				}
-				mc_db[p_item->grp.group_id].dst[i].sess_id = 0;
-				mc_db[p_item->grp.group_id].dst[i].sess_hash.h1 = 0;
-				mc_db[p_item->grp.group_id].dst[i].sess_hash.h2 = 0;
-			}
-			/* delete the grp sessions */
-			if ((ret = pp_session_delete(mc_route->p_entry - 1, NULL))) {
-				dbg("pp_session delete mcast grp sess ret Error:%d\n", ret);
-			}
-			p_item->mc_entry = mc_route->p_entry = 0;
-			/* reset the db entry */
-			mc_db[p_item->grp.group_id].used = 0;
-			mc_db[p_item->grp.group_id].grp_sess_hash.h1 = 0;
-			mc_db[p_item->grp.group_id].grp_sess_hash.h2 = 0;
-			ppa_memset(&mc_db[p_item->grp.group_id].stats, 0, sizeof(struct pp_stats));
-		} else {
-			dbg("MC group session exists\n");
-		}
+	eg_gid = p_item->grp.group_id;
+	spin_lock_bh(&g_hal_mc_db_lock);
+	if (!mc_eg_gid_is_exist(eg_gid)) {
 		spin_unlock_bh(&g_hal_mc_db_lock);
+		dbg("session eg_gid:%d doesn't exist!\n", eg_gid);
+		return PPA_FAILURE;
+	}
+	spin_unlock_bh(&g_hal_mc_db_lock);
+
+	/* handle multicast session specific to a destination */
+	if (mc_args->ig_gpid == g_mcast_nf.gpid) {
+		ig_gid = mc_args->groupid;
+		ig_dstid = mc_args->dst_idx;
+
+		dbg("adding client session for ig_gid:%d ig_dstid:%d eg_gid:%d",
+		    ig_gid, ig_dstid, eg_gid);
+		spin_lock_bh(&g_hal_mc_db_lock);
+		if (!mc_ig_dstid_is_exist(ig_gid, ig_dstid)) {
+			spin_unlock_bh(&g_hal_mc_db_lock);
+			dbg("session ig_gid:%d ig_dstid:%d doesn't exist!\n", ig_gid, ig_dstid);
+			return PPA_FAILURE;
+		}
+
+		/* delete the session, if the session exists but hw hash is not matching */
+		if (is_valid_session(mc_ig_dst(ig_gid, ig_dstid)->sess_id + 1)) {
+			/* Session exists but Add request is coming again
+			 * we need to compare the HASH and
+			 * if it is not matching delete the session
+			 */
+			if ((mc_ig_dst(ig_gid, ig_dstid)->sess_hash.h1 == mc_args->hwhash.h1) &&
+			    (mc_ig_dst(ig_gid, ig_dstid)->sess_hash.h2 == mc_args->hwhash.h2)) {
+				dbg("client session:%d exists for ig_gid:%d ig_dstid:%d\n",
+				    mc_ig_dst(ig_gid, ig_dstid)->sess_id,
+				    ig_gid, ig_dstid);
+				spin_unlock_bh(&g_hal_mc_db_lock);
+				return PPA_SUCCESS;
+			}
+
+			mc_dst_sess_delete(ig_gid, ig_dstid);
+			dbg("deleted client session:%d for ig_gid:%d ig_dstid:%d",
+			    mc_ig_dst(ig_gid, ig_dstid)->sess_id,
+			    ig_gid, ig_dstid);
+		}
+		mc_route->p_entry = p_item->mc_entry = mc_db.ig[ig_gid].sess_id;
+		spin_unlock_bh(&g_hal_mc_db_lock);
+
+		ret = mc_dst_sess_args_prepare(&pp_args, mc_args, p_item);
+		if (ret)
+			return PPA_FAILURE;
+
+		/* add hardware session */
+		ret = mc_dst_sess_create(ig_gid, ig_dstid, &pp_args, &session_id);
+		if (!ret) {
+			dbg("added client session:%d for ig_gid:%d ig_dstid:%d eg_gid:%d\n",
+			    session_id, ig_gid, ig_dstid, eg_gid);
+		}
+		return ret;
+	}
+
+	/* handle multicast session specific to a group */
+	dbg("adding group session for eg_gid:%d", eg_gid);
+	spin_lock_bh(&g_hal_mc_db_lock);
+	ig_gid = mc_gid_map_eg_to_ig(eg_gid);
+	session_id = mc_db.ig[ig_gid].sess_id;
+
+	/* delete the session, if the session exists but hw hash is not matching */
+	if (is_valid_session(session_id + 1)) {
+		if ((mc_db.ig[ig_gid].grp_sess_hash.h1 == mc_args->hwhash.h1) &&
+		    (mc_db.ig[ig_gid].grp_sess_hash.h2 == mc_args->hwhash.h2)) {
+			mc_route->p_entry = p_item->mc_entry = session_id;
+			dbg("group session:%d exists for ig_gid:%d\n",
+			    mc_db.ig[ig_gid].sess_id, ig_gid);
+			spin_unlock_bh(&g_hal_mc_db_lock);
+			return PPA_SUCCESS;
+		}
+		dbg("ig_gid:%d - no matching hash (%d, %d)!=(%d, %d) for group session:%d\n",
+		    ig_gid, mc_args->hwhash.h1, mc_args->hwhash.h2,
+		    mc_db.ig[ig_gid].grp_sess_hash.h1, mc_db.ig[ig_gid].grp_sess_hash.h2,
+		    mc_db.ig[ig_gid].sess_id);
+
+		/* delete all the dst sessions */
+		for_each_ig_dst(ig_gid, ig_dstid)
+			mc_dst_sess_delete(ig_gid, ig_dstid);
+
+		/* delete the group session */
+		mc_grp_sess_delete(ig_gid);
+		dbg("ig_gid:%d - deleted all sessions\n", ig_gid);
+	}
+	spin_unlock_bh(&g_hal_mc_db_lock);
+
+	ret = mc_grp_sess_args_prepare(&pp_args, mc_args, p_item, ig_gid);
+	if (ret)
+		return ret;
+
+	/* add hardware session */
+	ret = mc_grp_sess_create(ig_gid, &pp_args, &session_id);
+	if (!ret) {
+		mc_route->p_entry = p_item->mc_entry = session_id;
+		dbg("added group session:%d for eg_gid:%d\n", session_id, eg_gid);
 	}
 
 	return ret;
@@ -5325,17 +5726,19 @@ int32_t get_routing_entry_stats_diff(uint32_t session_id, uint8_t *f_hit, uint64
 {
 	int ret = PPA_SUCCESS;
 	struct pp_stats tmp_stats;
+	struct pp_stats *sess_stats = NULL;
 
 	spin_lock_bh(&g_hal_db_lock);
 	if ((session_id >= 0) && (session_id < g_max_hw_sessions) && (pp_hal_db[session_id].used)) {
+		sess_stats = pp_hal_db[session_id].stats;
 		ret = pp_session_stats_get(session_id, &tmp_stats);
-		if (ret == PPA_SUCCESS) {
-			if (tmp_stats.packets != pp_hal_db[session_id].stats.packets) {
-				*packets = tmp_stats.packets - pp_hal_db[session_id].stats.packets;
-				*bytes = tmp_stats.bytes - pp_hal_db[session_id].stats.bytes;
+		if (ret == PPA_SUCCESS && sess_stats) {
+			if (tmp_stats.packets != sess_stats->packets) {
+				*packets = tmp_stats.packets - sess_stats->packets;
+				*bytes = tmp_stats.bytes - sess_stats->bytes;
 				*f_hit = 1;
-				pp_hal_db[session_id].stats.packets = tmp_stats.packets;
-				pp_hal_db[session_id].stats.bytes = tmp_stats.bytes;
+				sess_stats->packets = tmp_stats.packets;
+				sess_stats->bytes = tmp_stats.bytes;
 			}
 		}
 	} else {
@@ -5348,24 +5751,39 @@ int32_t get_routing_entry_stats_diff(uint32_t session_id, uint8_t *f_hit, uint64
 int32_t get_mc_routing_entry_stats_diff(uint32_t session_id, uint16_t group_id,
 					uint8_t *f_hit, uint64_t *bytes, uint64_t *packets)
 {
-	int ret = PPA_SUCCESS;
+	int ret = PPA_FAILURE;
 	struct pp_stats tmp_stats;
+	uint16_t ig_gid;
 
 	spin_lock_bh(&g_hal_mc_db_lock);
-	if (is_valid_session(session_id) && (mc_db[group_id].used)) {
-		ret = pp_session_stats_get((session_id - 1), &tmp_stats);
-		if (ret == PPA_SUCCESS) {
-			if (tmp_stats.packets != mc_db[group_id].stats.packets) {
-				*packets = tmp_stats.packets - mc_db[group_id].stats.packets;
-				*bytes = tmp_stats.bytes - mc_db[group_id].stats.bytes;
-				*f_hit = 1;
-				mc_db[group_id].stats.packets = tmp_stats.packets;
-				mc_db[group_id].stats.bytes = tmp_stats.bytes;
-			}
-		}
-	} else {
-		ret = PPA_FAILURE;
+	if (!mc_eg_gid_is_exist(group_id)) {
+		dbg("eg_gid:%d doesn't exist!", group_id);
+		goto unlock_out;
 	}
+
+	ig_gid = mc_gid_map_eg_to_ig(group_id);
+	if (!mc_ig_gid_is_exist(ig_gid)) {
+		dbg("ig_gid:%d doesn't exist!", ig_gid);
+		goto unlock_out;
+	}
+
+	session_id = mc_db.ig[ig_gid].sess_id;
+	if (is_valid_session(session_id + 1)) {
+		ret = pp_session_stats_get(session_id, &tmp_stats);
+		if (ret)
+			goto unlock_out;
+
+		if (tmp_stats.packets != mc_db.ig[ig_gid].stats.packets) {
+			*packets = tmp_stats.packets - mc_db.ig[ig_gid].stats.packets;
+			*bytes = tmp_stats.bytes - mc_db.ig[ig_gid].stats.bytes;
+			*f_hit = 1;
+
+			mc_db.ig[ig_gid].stats.packets = tmp_stats.packets;
+			mc_db.ig[ig_gid].stats.bytes = tmp_stats.bytes;
+		}
+	}
+
+unlock_out:
 	spin_unlock_bh(&g_hal_mc_db_lock);
 	return ret;
 }
@@ -5540,20 +5958,6 @@ static int32_t lgm_pp_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, u
 			entry->max_mc_entries = MAX_MC_GROUP_ENTRIES;
 
 			return PPA_SUCCESS;
-		}
-	case PPA_GENERIC_HAL_GET_HAL_VERSION: {
-
-			PPA_VERSION *v = (PPA_VERSION *)buffer;
-			get_lgm_pp_hal_id(&v->family, &v->type, &v->itf, &v->mode, &v->major, &v->mid, &v->minor);
-
-			return PPA_SUCCESS;
-		}
-	case PPA_GENERIC_HAL_GET_PPE_FW_VERSION: {
-
-			PPA_VERSION *v = (PPA_VERSION *)buffer;
-			get_lgm_pp_hal_id(&v->family, &v->type, &v->itf, &v->mode, &v->major, &v->mid, &v->minor);
-
-			return get_firmware_id(&v->id, v->name, v->version);
 		}
 	case PPA_GENERIC_HAL_GET_PHYS_PORT_NUM: {
 
@@ -6151,7 +6555,7 @@ static inline void hal_init(void)
 	ppa_memset(pp_hal_db, 0, sizeof(PP_HAL_DB_NODE) * g_max_hw_sessions);
 
 	/*initalize the HAL MC DB*/
-	ppa_memset(mc_db, 0, sizeof(MC_DB_NODE) * MAX_MC_GROUP_ENTRIES);
+	ppa_memset(&mc_db, 0, sizeof(MC_DB_NODE));
 
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
 	/*Initialize Application litepath offload*/

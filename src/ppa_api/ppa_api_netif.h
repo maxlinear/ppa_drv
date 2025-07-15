@@ -153,6 +153,7 @@ struct netif_info {
 	PPA_LIST_NODE		list;
 	bool			enable;
 	bool			is_tc_configured;
+	uint8_t			tc_qdisc_cnt;
 	PPA_ATOMIC		count;
 	PPA_IFNAME		name[PPA_IF_NAME_SIZE];
 	/*only for simple network interface, like macvlan, wlan multiple SSIS,

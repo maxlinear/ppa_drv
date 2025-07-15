@@ -7,7 +7,7 @@
 ** DATE		: 4 NOV 2008
 ** AUTHOR	: Xu Liang
 ** DESCRIPTION  : PPA Protocol Stack Hook API Session Operation Functions
-** COPYRIGHT	: Copyright (c) 2020-2024 MaxLinear, Inc.
+** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
 ** 	              Copyright(c) 2009, Lantiq Deutschland GmbH
 **	              Am Campeon 3; 85579 Neubiberg, Germany
 **
@@ -247,6 +247,10 @@ static uint8_t get_correct_hdr_lvl(struct pktprs_hdr *h)
 {
 	if (PKTPRS_IS_MULTI_IP(h)) {
 		if (!(PKTPRS_IS_ESP(h, PKTPRS_HDR_LEVEL0)))
+			return PKTPRS_HDR_LEVEL1; /* inner */
+	} else if (PKTPRS_IS_MULTI_LEVEL(h)) {
+		/* for EoMPLS, no IP on outer pkt */
+		if (PKTPRS_MPLS_EXIST(h, PKTPRS_HDR_LEVEL0))
 			return PKTPRS_HDR_LEVEL1; /* inner */
 	}
 
@@ -558,6 +562,18 @@ static uint32_t pktprs_dslite_info(struct pktprs_hdr *h,
 	return 0;
 }
 
+static uint32_t pktprs_ip6ip6_info(struct pktprs_hdr *h,
+				 struct uc_session_node *p_item, PPA_BUF *ppa_buf)
+{
+	if (PKTPRS_IS_IPV6(h, PKTPRS_HDR_LEVEL0) &&
+		(PKTPRS_PROTO_NEXT(h, PKTPRS_PROTO_IPV6, PKTPRS_HDR_LEVEL0) ==
+		 PKTPRS_PROTO_DEST_OPT)) {
+		p_item->flag2 |= SESSION_FLAG2_IP6IP6;
+		return 1;
+	}
+	return 0;
+}
+
 static uint32_t pktprs_vxlan_info(struct pktprs_hdr *h,
 				struct uc_session_node *p_item)
 {
@@ -574,6 +590,19 @@ static uint32_t pktprs_6rd_info(struct pktprs_hdr *h,
 {
 	if (PKTPRS_IS_SIXRD(h)) {
 		p_item->flags |= SESSION_TUNNEL_6RD;
+		return 1;
+	}
+
+	return 0;
+}
+
+static uint32_t pktprs_ipip_info(struct pktprs_hdr *h,
+				 struct uc_session_node *p_item)
+{
+	if (PKTPRS_IS_IPV4(h, PKTPRS_HDR_LEVEL0) &&
+	    (PKTPRS_PROTO_NEXT(h, PKTPRS_PROTO_IPV4, PKTPRS_HDR_LEVEL0) ==
+	     PKTPRS_PROTO_IPV4)) {
+		p_item->flag2 |= SESSION_FLAG2_IPIP;
 		return 1;
 	}
 
@@ -5175,9 +5204,12 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	uint32_t idx;
 	struct pp_desc *ppdesc = NULL;
 	struct pp_hash hwhash;
-	IP_ADDR_C mc_grp = {0}, src_ip = {0};
+	IP_ADDR_C mc_grp = {0};
 	uint8_t lvl0_off, lvl1_off;
 	bool is_frag;
+#if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+	PPA_SUBIF *dp_port;
+#endif
 
 	if(!desc)
 		return PPA_FAILURE;
@@ -5227,13 +5259,12 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	/* multicast data packets */
 	if (pktprs_is_pkt_mc(desc->rx)) {
 		/*Lookup multicast session DB*/
-		mc_grp.f_ipv6 = src_ip.f_ipv6 = (l3_proto == ETH_P_IPV6) ? 1 : 0;
-		pktprs_src_ip((union nf_inet_addr *)&src_ip.ip, desc->rx);
+		mc_grp.f_ipv6 = (l3_proto == ETH_P_IPV6) ? 1 : 0;
 		pktprs_dst_ip((union nf_inet_addr *)&mc_grp.ip, desc->rx);
 		/*lock the mc_db*/
 		ppa_mc_get_htable_lock();
 		/*Do lookup */
-		ret = __ppa_lookup_mc_group(&mc_grp, &src_ip, &p_mc_item);
+		ret = __ppa_lookup_mc_gid(&mc_grp, mcast_helper_get_skb_gid(ppa_buf), &p_mc_item);
 
 		switch (ret) {
 		case PPA_MC_SESSION_VIOLATION:
@@ -5413,6 +5444,26 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 		p_item->host_bytes += ppa_skb_len(ppa_buf) + PPA_ETH_HLEN + PPA_ETH_CRCLEN;
 		p_item->num_adds++;
 
+#if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+		dp_port = ppa_malloc(sizeof(PPA_SUBIF));
+		if (dp_port) {
+			ppa_memset(dp_port, 0, sizeof(PPA_SUBIF));
+			if (!dp_get_netif_subifid(p_item->tx_if, ppa_buf, NULL, NULL, dp_port, 0)) {
+				if (dp_port->alloc_flag & DP_F_DOCSIS &&
+					ppa_buf->DW0 & DOCSIS_PS_BUFF_CTRL_LO) {
+					if (ppdesc && p_item->pkt.ip_proto == PPA_IPPROTO_UDP &&
+						p_item->pkt.src_port == 0) {
+						ppdesc->ps |= DOCSIS_PS_BUFF_CTRL_LO;
+						p_item->flag2 |= SESSION_FLAG2_HIGH_Q;
+					}
+
+					p_item->flags |= SESSION_NOT_ACCELABLE;
+				}
+			}
+			ppa_free(dp_port);
+		}
+#endif
+
 		ppa_atomic_set(&p_item->used, 2);
 
 		/*ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,",p_item size	= %d\n", sizeof(struct uc_session_node));*/
@@ -5485,6 +5536,10 @@ __ADD_SESSION_DONE:
 				p_item->flags &= ~SESSION_NOT_ACCEL_FOR_MGM;
 			}
 		} else if (p_item->flags & SESSION_NOT_ACCELABLE) {
+#if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+			if (p_item->flag2 & SESSION_FLAG2_HIGH_Q)
+				ppdesc->ps |= DOCSIS_PS_BUFF_CTRL_LO;
+#endif
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"session exists for SESSION_NOT_ACCELABLE already\n");
 		} else {
 
@@ -5564,6 +5619,12 @@ update_session:
 
 				if (!pktprs_6rd_info(desc->rx, p_item))
 					pktprs_6rd_info(desc->tx, p_item);
+
+				if (!pktprs_ipip_info(desc->rx, p_item))
+					pktprs_ipip_info(desc->tx, p_item);
+
+				if (!pktprs_ip6ip6_info(desc->rx, p_item, ppa_buf))
+					pktprs_ip6ip6_info(desc->tx, p_item, ppa_buf);
 
 				if (!pktprs_dslite_info(desc->rx, p_item))
 					pktprs_dslite_info(desc->tx, p_item);

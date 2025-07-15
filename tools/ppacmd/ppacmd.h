@@ -7,7 +7,7 @@
 ** DATE     : 28 Nov 2011
 ** AUTHOR     : Shao Guohua
 ** DESCRIPTION  : PPA (Routing Acceleration) User Configuration Utility
-** COPYRIGHT  : Copyright © 2020-2024 MaxLinear, Inc.
+** COPYRIGHT  : Copyright © 2020-2025 MaxLinear, Inc.
 **              Copyright (c) 2009, Lantiq Deutschland GmbH
 **              Am Campeon 3; 85579 Neubiberg, Germany
 **
@@ -40,13 +40,7 @@
 #define ppa_memset(buff, sz, val) \
   memset_s(buff, sz, val, sz);
 
-
-#define PPACMD_VERION_MAJOR   2
-#define PPACMD_VERION_MID     9
-#define PPACMD_VERION_MINOR   1
-
 #define PPA_TEST_AUTOMATION_ENABLE 0
-
 
 /* note, we canot include this header file, otherwise uint32_t will conflicts with system defined.
 ** So we have to define some macro here: */

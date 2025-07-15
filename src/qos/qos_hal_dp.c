@@ -4557,8 +4557,32 @@ static int qos_hal_add_queue(
 		QOS_Q_ADD_CFG *params,
 		uint32_t flags)
 {
+	dp_subif_t *dp_subif = NULL;
 
 	QOS_HAL_DEBUG_MSG(QOS_DEBUG_TRACE, "<%s> <-- Enter --> \n", __func__);
+
+	dp_subif = kzalloc(sizeof(*dp_subif), GFP_KERNEL);
+	if (!dp_subif) {
+		QOS_HAL_DEBUG_MSG(QOS_DEBUG_ERR, "%s: failed to allocate memory for"
+			" dp_subif\n", __func__);
+		return QOS_HAL_STATUS_ERR;
+	}
+	if (dp_get_netif_subifid(netdev, NULL, NULL, 0, dp_subif, 0) == DP_FAILURE){
+		QOS_HAL_DEBUG_MSG(QOS_DEBUG_ERR, "%s: Failed to get dp_subif\n",
+			__func__);
+		kfree(dp_subif);
+		return QOS_HAL_STATUS_ERR;
+	}
+
+	/* CoDel is not supported on PON vUNI due to FSQM buffer issues */
+	if ((params->drop.mode == QOS_MGR_DROP_CODEL) &&
+		(dp_subif->alloc_flag & DP_F_VUNI)) {
+		QOS_HAL_DEBUG_MSG(QOS_DEBUG_ERR, "CoDel is not supported on PON vUNI"
+			" interface\n");
+		kfree(dp_subif);
+		return QOS_HAL_STATUS_ERR;
+	}
+	kfree(dp_subif);
 
 	if ((flags & QOS_MGR_Q_F_INGRESS) == QOS_MGR_Q_F_INGRESS) {
 		return qos_hal_add_ingress_queue(

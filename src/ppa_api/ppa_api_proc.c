@@ -7,7 +7,7 @@
 ** DATE		: 3 NOV 2008
 ** AUTHOR	: Xu Liang
 ** DESCRIPTION  : PPA Protocol Stack Hook API Proc Filesystem Functions
-** COPYRIGHT	: Copyright (c) 2020-2024 MaxLinear, Inc.
+** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
 **                Copyright (c) 2009, Lantiq Deutschland GmbH
 **                Am Campeon 3; 85579 Neubiberg, Germany
 **
@@ -141,7 +141,6 @@ static void *proc_read_bridging_session_seq_next(struct seq_file *, void *, loff
 static void proc_read_uc_session_seq_stop(struct seq_file *, void *);
 static void proc_read_mc_session_seq_stop(struct seq_file *, void *);
 static void proc_read_bridging_session_seq_stop(struct seq_file *, void *);
-static void printk_session_ifid(char *, uint32_t);
 static void printk_session_flags(char *, uint32_t);
 #if defined(ENABLE_SESSION_DEBUG_FLAGS) && ENABLE_SESSION_DEBUG_FLAGS
 static void printk_session_debug_flags(char *, uint32_t);
@@ -474,16 +473,6 @@ static const struct file_operations dbgfs_file_mini_bridging_session_seq_fops = 
 static uint32_t dbgfs_read_uc_session_pos;
 static uint32_t dbgfs_read_mc_session_pos;
 static uint32_t dbgfs_read_bridging_session_pos;
-static char *g_str_dest[] = {
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	NULL
-};
 
 #if IS_ENABLED(CONFIG_PPA_API_SW_FASTPATH)
 static const struct file_operations dbgfs_file_swfp_status = {
@@ -1595,14 +1584,6 @@ static void proc_read_bridging_session_seq_stop(struct seq_file *seq, void *v)
 	ppa_bridging_session_stop_iteration();
 }
 
-static void printk_session_ifid(char *str, uint32_t ifid)
-{
-	const char *pstr =  ifid < NUM_ENTITY(g_str_dest) ? g_str_dest[ifid] : "INVALID";
-
-	printk(str);
-	printk("%u - %s\n", ifid, pstr);
-}
-
 static void printk_session_flags(char *str, uint32_t flags)
 {
 	static const char *str_flag[] = {
@@ -2203,9 +2184,13 @@ void ppa_unicast_routing_print_session(struct uc_session_node *p_item)
 	printk("    skb priority     = %02u\n",   p_item->pkt.priority);
 	printk("    skb mark         = %02u\n",   p_item->pkt.mark);
 	printk("    reference count  = %d\n",   ppa_atomic_read(&p_item->used));
-	printk_session_ifid("    dest_ifid        = ",   p_item->dest_ifid);
 
 	printk_session_flags("    flags            = ", p_item->flags);
+	if (p_item->flag2 & SESSION_FLAG2_IPIP)
+		printk("    4in4 session\n");
+	if (p_item->flag2 & SESSION_FLAG2_IP6IP6)
+		printk("    6in6 session\n");
+
 #if defined(ENABLE_SESSION_DEBUG_FLAGS) && ENABLE_SESSION_DEBUG_FLAGS
 	printk_session_debug_flags("    debug_flags      = ", p_item->debug_flags);
 #endif
@@ -2300,8 +2285,7 @@ static unsigned char *ppa_sw_ltcp_lro_name()
 
 void ppa_multicast_routing_print_session(struct mc_session_node *p_item)
 {
-	int i, j;
-	uint32_t bit;
+	int i;
 	int8_t strbuf[64];
 
 	printk("    next             = %px\n", p_item->mc_hlist.next);
@@ -2323,11 +2307,6 @@ void ppa_multicast_routing_print_session(struct mc_session_node *p_item)
 	printk("    new_vci          = %04X\n", (uint32_t)p_item->grp.new_vci);
 	printk("    out_vlan_tag     = %08X\n", p_item->grp.out_vlan_tag);
 	printk("    dslwan_qid       = %u\n",   (uint32_t)p_item->dslwan_qid);
-
-	for (i = j = 0, bit = 1; i < sizeof(p_item->dest_ifid) * 8; i++, bit <<= 1)
-		if ((p_item->dest_ifid & bit)) {
-			printk_session_ifid("    dest_ifid        = ", i);
-		}
 
 	printk_session_flags("    flags            = ", p_item->flags);
 
@@ -2353,7 +2332,6 @@ void ppa_bridging_print_session(struct br_mac_node *p_item)
 	printk("    last_hit_time    = %d\n",   p_item->last_hit_time);
 	printk("    dslwan_qid       = %d\n",   (uint32_t)p_item->dslwan_qid);
 
-	printk_session_ifid("    dest_ifid        = ",   p_item->dest_ifid);
 
 	printk_session_flags("    flags            = ", p_item->flags);
 
@@ -2772,85 +2750,6 @@ static struct ppa_debugfs_files ppa_dbgfs_files[] = {
 
 void ppa_api_debugfs_create(void)
 {
-	uint32_t f_incorrect_fw = 1;
-	int i;
-	PPA_VERSION ver={0};
-
-	ver.index = 1;
-	if( ppa_drv_get_firmware_id(&ver, 0) != PPA_SUCCESS) {
-		ver.index = 0;
-		ppa_drv_get_firmware_id(&ver, 0);
-	}
-	switch ( ver.family ) {
-	case 1: /*  Danube */
-	case 2: /*  Twinpass */
-	case 3: /*  Amazon-SE */
-		g_str_dest[0] = "ETH0";
-		g_str_dest[2] = "CPU0";
-		g_str_dest[3] = "EXT_INT1";
-		g_str_dest[4] = "EXT_INT2";
-		g_str_dest[5] = "EXT_INT3";
-		g_str_dest[6] = "EXT_INT4";
-		g_str_dest[7] = "EXT_INT5";
-		if ( ver.itf == 1 && ver.family != 3) {
-			/*  D4*/
-			g_str_dest[1] = "ETH1";
-			f_incorrect_fw = 0;
-		} else if ( ver.itf == 2 ) {
-			/*  A4*/
-			g_str_dest[1] = "ATM";
-			f_incorrect_fw = 0;
-		}
-		break;
-	case 5: /* AR9  */
-	case 6: /*  GR9 */
-		g_str_dest[0] = "ETH0";
-		g_str_dest[1] = "ETH1";
-		g_str_dest[2] = "CPU0";
-		g_str_dest[3] = "EXT_INT1";
-		g_str_dest[4] = "EXT_INT2";
-		g_str_dest[5] = "EXT_INT3";
-		if ( ver.itf == 1 ) {
-			/*  D5 */
-			g_str_dest[6] = "EXT_INT4";
-			g_str_dest[7] = "EXT_INT5";
-			f_incorrect_fw = 0;
-		} else if ( ver.itf == 4 ) {
-			/*  A5 */
-			g_str_dest[6] = "ATM_res";
-			g_str_dest[7] = "ATM";
-			f_incorrect_fw = 0;
-		}
-		/* fallthrough */
-	case 7: /*  VR9 */
-		g_str_dest[0] = "ETH0";
-		g_str_dest[1] = "ETH1";
-		g_str_dest[2] = "CPU0";
-		g_str_dest[3] = "EXT_INT1";
-		g_str_dest[4] = "EXT_INT2";
-		g_str_dest[5] = "EXT_INT3";
-		if ( ver.itf == 1 ) {
-			/*  D5 */
-			g_str_dest[6] = "EXT_INT4";
-			g_str_dest[7] = "EXT_INT5";
-			f_incorrect_fw = 0;
-		} else if ( ver.itf == 4 ) {
-			/*  A5 */
-			g_str_dest[6] = "ATM_res";
-			g_str_dest[7] = "ATM";
-			f_incorrect_fw = 0;
-		} else if ( ver.itf == 5 ) {
-			/*  E5 */
-			g_str_dest[6] = "PTM_res";
-			g_str_dest[7] = "PTM";
-			f_incorrect_fw = 0;
-		}
-	}
-	if ( f_incorrect_fw ) {
-		for ( i = 0; i < NUM_ENTITY(g_str_dest); i++ )
-			g_str_dest[i] = "INVALID";
-	}
-
 	ppa_debugfs_create(ppa_debugfs_dir_get(), "core",
 		&dbgfs_ppa_api, ppa_dbgfs_files,
 		ARRAY_SIZE(ppa_dbgfs_files));

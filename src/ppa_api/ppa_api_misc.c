@@ -7,7 +7,7 @@
  ** DATE	: 3 NOV 2008
  ** AUTHOR	: Xu Liang
  ** DESCRIPTION : PPA Protocol Stack Hook API Miscellaneous Functions
- ** COPYRIGHT	: Copyright (c) 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2009, Lantiq Deutschland GmbH
  **               Am Campeon 3; 85579 Neubiberg, Germany
  **
@@ -107,21 +107,6 @@ extern int32_t (*ppa_drv_hal_generic_hook)(PPA_GENERIC_HOOK_CMD cmd, void *buffe
 
 long ppa_dev_ioctl(struct file *, unsigned int, unsigned long);
 static int32_t ppa_get_all_vlan_filter_count(uint32_t);
-/* since no where used following functions, commentd*/
-#if 0
-static int ppa_dev_open(struct inode *, struct file *);
-static int ppa_dev_release(struct inode *, struct file *);
-#ifdef PPA_API_PROC
-static int print_ppa_subsystem_ver(char *, int, char *, unsigned int , unsigned int , unsigned int,
-		unsigned int , unsigned int , unsigned int , unsigned int , unsigned int );
-static int print_driver_ver(char *, int, char *, unsigned int, unsigned int, unsigned int,
-		unsigned int, unsigned int, unsigned int, unsigned int);
-
-static void proc_file_create(void);
-static void proc_file_delete(void);
-static int proc_read_ver(struct seq_file *seq, void *v);
-#endif
-#endif
 
 int32_t ppa_ioctl_bridge_enable(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
 int32_t ppa_ioctl_get_bridge_enable_status(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
@@ -450,8 +435,8 @@ long ppa_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				goto EXIT_EFAULT;
 
 			ppa_enable(0, 0, 0);
-			ppa_exit();
-			goto EXIT_ZERO;
+			res = ppa_exit();
+			goto EXIT_LAST;
 		}
 		case PPA_CMD_ENABLE: {
 			if (!capable(CAP_NET_ADMIN))
@@ -977,28 +962,8 @@ long ppa_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if (!capable(CAP_NET_ADMIN))
 				goto EXIT_EFAULT;
 			ppa_memset(&cmd_info->ver, 0, sizeof(cmd_info->ver) );
-			ppa_get_api_id(&cmd_info->ver.ppa_api_ver.family, &cmd_info->ver.ppa_api_ver.type,
-				&cmd_info->ver.ppa_api_ver.itf, &cmd_info->ver.ppa_api_ver.mode, &cmd_info->ver.ppa_api_ver.major,
-				&cmd_info->ver.ppa_api_ver.mid, &cmd_info->ver.ppa_api_ver.minor);
-			ppa_get_stack_al_id(&cmd_info->ver.ppa_stack_al_ver.family, &cmd_info->ver.ppa_stack_al_ver.type,
-				&cmd_info->ver.ppa_stack_al_ver.itf, &cmd_info->ver.ppa_stack_al_ver.mode,
-				&cmd_info->ver.ppa_stack_al_ver.major, &cmd_info->ver.ppa_stack_al_ver.mid, &cmd_info->ver.ppa_stack_al_ver.minor);
-
-			if( ppa_drv_get_hal_id(&cmd_info->ver.ppe_hal_ver,0) == PPA_SUCCESS) {
-				cmd_info->ver.ppe_fw_ver[0].index = 0;
-				cmd_info->ver.ppe_fw_ver[1].index = 1;
-				ppa_drv_get_firmware_id(&cmd_info->ver.ppe_fw_ver[0], 0);
-				ppa_drv_get_firmware_id(&cmd_info->ver.ppe_fw_ver[1], 0);
-			}
-			ppa_subsystem_id(&cmd_info->ver.ppa_subsys_ver.family, &cmd_info->ver.ppa_subsys_ver.type, &cmd_info->ver.ppa_subsys_ver.itf,
-				&cmd_info->ver.ppa_subsys_ver.mode, &cmd_info->ver.ppa_subsys_ver.major, &cmd_info->ver.ppa_subsys_ver.mid,
-				&cmd_info->ver.ppa_subsys_ver.minor, &cmd_info->ver.ppa_subsys_ver.tag);
-#if IS_ENABLED(CONFIG_IPV6)
-			cmd_info->ver.ppa_feature.ipv6_en = 1;
-#endif
-#if IS_ENABLED(CONFIG_PPA_QOS)
-			cmd_info->ver.ppa_feature.qos_en = 1;
-#endif
+			ppa_get_ver_id(&cmd_info->ver.ppa_ver.major, &cmd_info->ver.ppa_ver.mid,
+				&cmd_info->ver.ppa_ver.minor, cmd_info->ver.ppa_ver.tag);
 
 			if ( ppa_copy_to_user(  (void *)arg, &cmd_info->ver, sizeof(cmd_info->ver)) != 0 )
 				goto EXIT_EFAULT;
@@ -2033,18 +1998,4 @@ int32_t ppa_api_init(void)
 PPA_API_SESSION_MANAGER_CREATE_FAIL:
 	ppa_drv_hal_exit(0);
 	return -1;
-}
-
-void __exit ppa_driver_exit(void)
-{
-	ppa_exit();
-	ppa_export_fn_manager_exit();
-
-	ppa_api_sysfs_exit();
-	ppa_api_debugfs_destroy();
-#if IS_ENABLED(CONFIG_SOC_GRX500)
-	ppa_api_procfs_destroy();
-#endif
-	ppa_api_session_manager_destroy();
-
 }

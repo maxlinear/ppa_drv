@@ -7,7 +7,7 @@
  ** DATE		 : 4 NOV 2008
  ** AUTHOR	   : Xu Liang
  ** DESCRIPTION  : PPA Protocol Stack Adaption Layer (Linux)
- ** COPYRIGHT	: Copyright © 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright © 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2009
  **		  Lantiq Deutschland GmbH
  **		  Am Campeon 3; 85579 Neubiberg, Germany
@@ -20,33 +20,6 @@
  ** 04 NOV 2008  Xu Liang		Initiate Version
  ** 10 Jul 2017  Kamal Eradath   Standalone stack adaptation layer
  *******************************************************************************/
-/*
- * ####################################
- *			  Version No.
- * ####################################
- */
-#define VER_FAMILY	0x60	/*  bit 0: res	*/
-/*		1: Danube	*/
-/*		2: Twinpass	*/
-/*		3: Amazon-SE	*/
-/*		4: res		*/
-/*		5: AR9		*/
-/*		6: GR9		*/
-#define VER_DRTYPE	0x10	/*  bit 0: Normal Data Path driver*/
-/*		1: Indirect-Fast Path driver	*/
-/*		2: HAL driver			*/
-/*		3: Hook driver			*/
-/*		4: Stack/System Adaption Layer driver */
-/*		5: PPA API driver		*/
-#define VER_INTERFACE	0x00	/*  bit 0: MII 0*/
-/*		1: MII 1	*/
-/*		2: ATM WAN	*/
-/*		3: PTM WAN	*/
-#define VER_ACCMODE	0x00	/*  bit 0: Routing*/
-/*		1: Bridging	*/
-#define VER_MAJOR	0
-#define VER_MID		0
-#define VER_MINOR	3
 /*
  * ####################################
  *			  Head File
@@ -195,35 +168,6 @@ static uint8_t *ppa_get_transport_header(const PPA_BUF *ppa_buf);
  *		   Global Function
  * ####################################
  */
-void ppa_get_stack_al_id(uint32_t *p_family,
-		uint32_t *p_type,
-		uint32_t *p_if,
-		uint32_t *p_mode,
-		uint32_t *p_major,
-		uint32_t *p_mid,
-		uint32_t *p_minor)
-{
-	if ( p_family )
-		*p_family = VER_FAMILY;
-
-	if ( p_type )
-		*p_type = VER_DRTYPE;
-
-	if ( p_if )
-		*p_if = VER_INTERFACE;
-
-	if ( p_mode )
-		*p_mode = VER_ACCMODE;
-
-	if ( p_major )
-		*p_major = VER_MAJOR;
-
-	if ( p_mid )
-		*p_mid = VER_MID;
-
-	if ( p_minor )
-		*p_minor = VER_MINOR;
-}
 
 PPA_SESSION *ppa_get_session(PPA_BUF *ppa_buf)
 {
@@ -1126,7 +1070,7 @@ ppp_ret:
 #endif
 
 #if IS_ENABLED(CONFIG_IPV6_SIT)
-	if( netif->type == ARPHRD_SIT){
+	if ((netif->type == ARPHRD_SIT) || (netif->type == ARPHRD_TUNNEL)) {
 		if((netif = (PPA_NETIF *)ppa_get_6rd_phyif(netif)) == NULL){
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"6RD, cannot get physical device\n");
 			return PPA_FAILURE;
@@ -2434,7 +2378,6 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("PPA Stack Adaptation Layer");
 
 
-EXPORT_SYMBOL(ppa_get_stack_al_id);
 EXPORT_SYMBOL(ppa_get_session);
 EXPORT_SYMBOL(ppa_get_pkt_ip_proto);
 EXPORT_SYMBOL(ppa_get_pkt_ip_tos);

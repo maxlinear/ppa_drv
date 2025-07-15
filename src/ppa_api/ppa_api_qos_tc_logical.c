@@ -398,7 +398,7 @@ static int32_t ppa_qos_sched_del(PPA_IFNAME *ifname)
 	if (port_idx == -1)
 		return PPA_FAILURE;
 
-	if (base_sch_info[port_idx].lif_count == 0) {
+	if (base_sch_info[port_idx].lif_count == 1) {
 		/* No QoS configuration on LIF's, delete L1 base scheduler */
 		ret = ppa_qos_del_base_sched(base_sch_info[port_idx].sch_id);
 		if (ret != PPA_SUCCESS)
@@ -417,6 +417,7 @@ static int32_t ppa_qos_sched_del(PPA_IFNAME *ifname)
 		for (i = 0; i < PPA_QOS_MAX_VAP_PER_SCH; i++) {
 			if (strcmp(ifname, l2_sch->lif_name[i]) == 0) {
 				memset(l2_sch->lif_name[i], '\0', PPA_IF_NAME_SIZE);
+				l2_sch->lif_count--;
 				break;
 			}
 		}
@@ -443,8 +444,10 @@ static int32_t ppa_qos_sched_del(PPA_IFNAME *ifname)
 		}
 	}
 	for (lif_idx = 0; lif_idx < PPA_QOS_MAX_SUPPORTED_LIF; lif_idx++) {
-		if (strcmp(ifname, base_sch_info[port_idx].lif_name[lif_idx]) == 0)
+		if (strncmp(ifname, base_sch_info[port_idx].lif_name[lif_idx], IFNAMSIZ) == 0) {
 			memset(base_sch_info[port_idx].lif_name[lif_idx], '\0', IFNAMSIZ);
+			base_sch_info[port_idx].lif_count--;
+		}
 	}
 
 	return ret;
@@ -486,29 +489,6 @@ static void ppa_qos_fill_tc_params(PPA_IFNAME *ifname, struct qos_tc_params *tc_
 		tc_params->def_q = -1;
 }
 
-/**
- * @brief: This function updates lif_count when a scheduler is added or deleted.
- */
-static void ppa_qos_update_lif_count(PPA_IFNAME *ifname, enum tc_setup_type type,
-		void *type_data)
-{
-	int32_t port_idx;
-	struct base_sched *l2_sch = NULL;
-
-	port_idx = ppa_qos_get_base_sch_info(ifname);
-	if (port_idx == -1)
-		return;
-
-	l2_sch = ppa_qos_get_l2_sched_info(ifname, port_idx);
-	if (ppa_qos_is_sched_add_config(type, type_data))
-		base_sch_info[port_idx].lif_count++;
-	else if (ppa_qos_is_sched_del_config(type, type_data)) {
-		base_sch_info[port_idx].lif_count--;
-		if (l2_sch)
-			l2_sch->lif_count--;
-	}
-}
-
 int32_t ppa_qos_get_base_sch_id(void)
 {
 	return base_sch_info[0].sch_id;
@@ -529,7 +509,7 @@ static int32_t ppa_qos_update_base_sch_info(enum tc_setup_type type, void *type_
 	struct net *net = NULL;
 	PPA_NETIF *base_dev = NULL;
 	int32_t port_idx, lif_idx, ret;
-	uint32_t max_qdisc;
+	int8_t max_qdisc;
 
 	/* Check if subif info is already exist in the base_sch_info */
 	port_idx = ppa_qos_get_base_sch_info(ifname);
@@ -599,6 +579,7 @@ static int32_t ppa_qos_update_base_sch_info(enum tc_setup_type type, void *type_
 		if (base_sch_info[port_idx].lif_name[lif_idx][0] == '\0') {
 			strncpy(base_sch_info[port_idx].lif_name[lif_idx], ifname,
 					PPA_IF_NAME_SIZE);
+			base_sch_info[port_idx].lif_count++;
 			break;
 		}
 	}
@@ -640,26 +621,34 @@ int32_t ppa_qos_tc_setup(struct net_device *dev, enum tc_setup_type type,
 					" %s\n", dev->name);
 			goto TC_QOS_DONE;
 		}
+		p_ifinfo->tc_qdisc_cnt++;
 		p_ifinfo->is_tc_configured = true;
 	}
 
 	/* Fill tc_params that needs to be sent to qos-tc. */
 	ppa_qos_fill_tc_params(dev->name, &tc_params);
+	/* CoDel is not supported on PON vUNI due to FSQM buffer issues */
+	if (tc_params.dp_alloc_flag & DP_F_VUNI && type == TC_SETUP_QDISC_CODEL) {
+		netdev_err(dev, "CoDel is not supported on PON vUNI interface\n");
+		goto TC_QOS_DONE;
+	}
 	ret = qos_tc_setup_ext(dev, type, type_data, &tc_params);
 	if (ret != 0)
 		goto TC_QOS_DONE;
 
-	/* Update lif count */
-	ppa_qos_update_lif_count(dev->name, type, type_data);
 
 	if (ppa_qos_is_sched_del_config(type, type_data)) {
-		ret = ppa_qos_sched_del(dev->name);
-		if (ret != PPA_SUCCESS) {
-			ppa_debug(DBG_ENABLE_MASK_ERR, "Failed to delete base scheduler for"
-					" %s\n", dev->name);
-			goto TC_QOS_DONE;
+		if (p_ifinfo->tc_qdisc_cnt == 1) {
+			ret = ppa_qos_sched_del(dev->name);
+			if (ret != PPA_SUCCESS) {
+				ppa_debug(DBG_ENABLE_MASK_ERR, "Failed to delete base scheduler"
+					" for %s\n", dev->name);
+				goto TC_QOS_DONE;
+			}
 		}
-		p_ifinfo->is_tc_configured = false;
+		p_ifinfo->tc_qdisc_cnt--;
+		if (!p_ifinfo->tc_qdisc_cnt)
+			p_ifinfo->is_tc_configured = false;
 	}
 
 TC_QOS_DONE:

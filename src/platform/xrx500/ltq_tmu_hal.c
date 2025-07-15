@@ -7,7 +7,7 @@
  ** DATE	: 8 Aug 2014
  ** AUTHOR	: Purnendu Ghosh
  ** DESCRIPTION	: TMU HAL Layer
- ** COPYRIGHT	: Copyright © 2020-2021 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright © 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2009, Lantiq Deutschland GmbH
  **               Am Campeon 3; 85579 Neubiberg, Germany
  **
@@ -624,21 +624,6 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 		res = tmu_hal_qos_uninit_cfg(); 
 		return res;
 	} 
-	case PPA_GENERIC_HAL_GET_HAL_VERSION: {
-		PPA_VERSION *v = (PPA_VERSION *)buffer;
-		v->major = 0;
-		v->mid = 0;
-		v->minor = 1;
-		return PPA_SUCCESS;
-	}
-	case PPA_GENERIC_HAL_GET_PPE_FW_VERSION: {
-		PPA_VERSION *v=(PPA_VERSION *)buffer;
-		v->major = 1;
-		v->mid = 1;
-		v->minor =	0 ;
-
-		return PPA_SUCCESS;
-	}	 
 	case PPA_GENERIC_HAL_GET_QOS_STATUS: {
 		return get_qos_status((PPA_QOS_STATUS *)buffer);
 	}

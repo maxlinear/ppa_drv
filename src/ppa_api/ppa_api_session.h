@@ -11,7 +11,7 @@
  ** AUTHOR	: Xu Liang
  ** DESCRIPTION	: PPA Protocol Stack Hook API Session Operation Functions Header
  **				File
- ** COPYRIGHT	: Copyright (c) 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2017 Intel Corporation
  **
  ** HISTORY
@@ -139,6 +139,8 @@
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
 #define MC_GRP_MASK 0x1FF	/*bit 0-8*/
 #define MC_DST_MASK 0x3C0000	/*bit 18-21*/
+
+#define DOCSIS_PS_BUFF_CTRL_LO (BIT(6))
 #endif /*IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)*/
 /*#define MAX_QOS_CAPS 		2*/
 

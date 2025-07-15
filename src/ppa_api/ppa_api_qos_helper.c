@@ -835,9 +835,10 @@ static void ppa_qos_update_high_prio_q(uint32_t prio, netdev_qos_priv *devqospri
 static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 	struct netdev_attr *attr)
 {
-	int32_t dp_q = -1;
+	int32_t i, dp_q = -1;
 	int32_t pp_q = 0;
 	uint32_t prio = 0U;
+	uint32_t prio_bkp = 0U;
 	PPA_NETIF *txif = NULL;
 	PPA_IFNAME phys_netif_name[PPA_IF_NAME_SIZE];
 	netdev_qos_priv *devqospriv = NULL;
@@ -872,20 +873,30 @@ static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 		netifdev->name, txif->name, attr->mark);
 
 	if (devqospriv->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
-		prio = attr->tc + 1;
+		prio_bkp = attr->tc + 1;
 	} else {
 #ifdef HAVE_QOS_EXTMARK
 		GET_DATA_FROM_MARK_OPT(attr->mark, QUEPRIO_MASK, QUEPRIO_START_BIT_POS,
-				prio);
+				prio_bkp);
 #else
 		GET_DATA_FROM_MARK_OPT(attr->mark, MARK_QUEPRIO_MASK,
-				MARK_QUEPRIO_START_BIT_POS, prio);
+				MARK_QUEPRIO_START_BIT_POS, prio_bkp);
 #endif
 	}
 
+	prio = prio_bkp;
+	/* For unclassified traffic, use the prio of usr-def-q to get dst_q_high */
+	if (!prio && devqospriv->usr_def_q > 0) {
+		for (i = 1; i < PORT_MAX_Q; i++) {
+			if (devqospriv->qid_map[i] == devqospriv->usr_def_q) {
+				prio = i;
+				break;
+			}
+		}
+	}
 	if (prio) {
 		ppa_qos_update_high_prio_q(prio, devqospriv, attr);
-		dp_q = devqospriv->qid_map[prio];
+		dp_q = devqospriv->qid_map[prio_bkp];
 	}
 
 	if (dp_q == -1)
@@ -898,8 +909,8 @@ static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 		dp_q = devqospriv->qid_map[0];
 		pp_q = ppa_dpm_to_pp_qos(dp_q);
 	}
-	MODULE_DBG("devqospriv dev %s prio %d dp_q %d pp_q %d\n",
-			devqospriv->netif->name, prio, dp_q, pp_q);
+	MODULE_DBG("devqospriv dev %s prio %u dp_q %d pp_q %d\n",
+			devqospriv->netif->name, prio_bkp, dp_q, pp_q);
 	rcu_read_unlock();
 	return pp_q;
 }

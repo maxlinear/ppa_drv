@@ -140,10 +140,13 @@ static int ppa_dev_release(struct inode *inode, struct file *file)
 
 static long ppa_drv_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	long ret = 0;
 #if IS_ENABLED(CONFIG_PPA_ACCEL)
-	ppa_dev_ioctl(file, cmd, arg);
+	ret = ppa_dev_ioctl(file, cmd, arg);
+	if (cmd != PPA_CMD_EXIT)
+		ret = 0;
 #endif
-	return 0;
+	return ret;
 }
 
 /*

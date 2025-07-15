@@ -8,7 +8,7 @@
 ** AUTHOR		: Lantiq
 ** DESCRIPTION		: Function to offload CPU and increase Performance
 **			once PPE sessions are exhausted.
-** COPYRIGHT : Copyright © 2020-2024 MaxLinear, Inc.
+** COPYRIGHT : Copyright © 2020-2025 MaxLinear, Inc.
 **             Copyright (c) 2013
 **             Lantiq Deutschland GmbH
 **             Am Campeon 3; 85579 Neubiberg, Germany
@@ -174,7 +174,7 @@ typedef unsigned int	uint32_t;
 typedef unsigned short	uint16_t;
 extern int ppa_find_session_from_skb(PPA_BUF* skb, uint8_t pf, struct uc_session_node **pp_item);
 extern void ppa_session_put(struct uc_session_node* p_item);
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 extern int ppa_sw_litepath_local_deliver(struct sk_buff *skb);
 extern uint32_t (*get_litepath_port_hook)(void);
 int32_t (*hw_litepath_xmit_fn)(PPA_SKBUF *) = NULL;
@@ -244,11 +244,17 @@ unsigned short swa_sw_out_header_len(uint32_t flags, uint32_t flag2,
 			}
 		} else if( Is6rdSession(flags) ) {
 		/* Handle DS-Lite Tunneled sessions */ 
-			if(	IsLanSession(flags) ) {
+			if(IsLanSession(flags)) {
 				headerlength += IPV4_HDR_LEN;
 			} else {
 				*ethtype = ETH_P_IPV6; 
 			}
+		} else if (flag2 & SESSION_FLAG2_IPIP) {
+			if (IsLanSession(flags))
+				headerlength += IPV4_HDR_LEN;
+		} else if (flag2 & SESSION_FLAG2_IP6IP6) {
+			if (IsLanSession(flags))
+				headerlength += (IPV6_HDR_LEN + SZ_8);
 #if defined(L2TP_CONFIG) && L2TP_CONFIG
 		} else if (IsL2TPSession(flags)) {
 			if (IsLanSession(flags))
@@ -282,7 +288,7 @@ HW_LITEPATH:
 	return headerlength;	 
 }
 
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 static struct dst_entry * swa_get_pkt_dst(PPA_BUF *skb, PPA_NETIF* netif)
 {
 	struct dst_entry *dst=NULL;
@@ -485,7 +491,7 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 		swaHdr.transport_offset = tlen + ((isIPv6)?IPV6_HDR_LEN:IPV4_HDR_LEN);
 		swaHdr.tot_hdr_len = tlen;
 		swaHdr.type = SW_ACC_TYPE_BRIDGED;
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 	/*local session = CPU_BOUND */
 	} else if((p_item->flag2 & SESSION_FLAG2_CPU_IN) && !tx_ifinfo) {
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d\n", __FUNCTION__, __LINE__);
@@ -513,9 +519,10 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 			swaHdr.tot_hdr_len);
 		swa_dump_skb(metainfo->skb->data, 128, 0);
 #endif /* IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) */
-	} else if( IsTunneledSession(p_item->flags) ) {
-		swaHdr.tot_hdr_len = tlen;
+	} else if ((p_item->flag2 & SESSION_FLAG2_IPIP) ||
+		  (p_item->flag2 & SESSION_FLAG2_IP6IP6)) {
 
+		swaHdr.tot_hdr_len = tlen;
 #if defined(L2TP_CONFIG) && L2TP_CONFIG
 		if (IsL2TPSession(p_item->flags)) {
 			swaHdr.type = SW_ACC_TYPE_L2TP;
@@ -532,18 +539,43 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 			swaHdr.type = SW_ACC_TYPE_DSLITE;
 			if( IsLanSession(p_item->flags) ) {
 				swaHdr.network_offset = tlen - IPV6_HDR_LEN;
-				swaHdr.transport_offset = tlen ; /* transport header is poingting to inner IPv4 */
+				swaHdr.transport_offset = tlen ; /* transport header: inner IPv4 */
 				isIPv6 = 1;
 			} else {
 				swaHdr.network_offset = tlen;
 				swaHdr.transport_offset = tlen + IPV4_HDR_LEN;
+			}
+		} else if (p_item->flag2 & SESSION_FLAG2_IPIP) {
+			/* ipip tunnel */
+			swaHdr.type = SW_ACC_TYPE_IPIP;
+			if (IsLanSession(p_item->flags)) {
+				swaHdr.network_offset = tlen - IPV4_HDR_LEN;
+				/* transport header points to inner IPv4 */
+				swaHdr.transport_offset = tlen;
+				isIPv6 = 0;
+			} else {
+				swaHdr.network_offset = tlen;
+				swaHdr.transport_offset = tlen + IPV4_HDR_LEN;
+			}
+		} else if (p_item->flag2 & SESSION_FLAG2_IP6IP6) {
+			/* 6in6 tunnel */
+			swaHdr.type = SW_ACC_TYPE_IP6IP6;
+			if (IsLanSession(p_item->flags)) {
+				/* 8B Destination Options for IPv6 */
+				swaHdr.network_offset = tlen - (IPV6_HDR_LEN + SZ_8);
+				/* transport header points to inner IPv6 */
+				swaHdr.transport_offset = tlen;
+				isIPv6 = 1;
+			} else {
+				swaHdr.network_offset = tlen;
+				swaHdr.transport_offset = tlen + IPV6_HDR_LEN;
 			}
 		} else {
 			/* 6rd tunnel */
 			swaHdr.type = SW_ACC_TYPE_6RD;
 			if( IsLanSession(p_item->flags) ) {
 				swaHdr.network_offset = tlen - IPV4_HDR_LEN;
-				swaHdr.transport_offset = tlen ; /* transport header is poingting to inner IPv4 */
+				swaHdr.transport_offset = tlen ; /* transport header:inner IPv4 */
 				isIPv6 = 0;
 			} else {
 				swaHdr.network_offset = tlen;
@@ -584,11 +616,11 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 
 	hdr = p_swaHdr->hdr;
 
-#if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+#if IS_ENABLED(CONFIG_PPA_EXT_PKT_LEARNING)
 	/* In case of LGM we have the final EG skb at this point*/
 	memcpy(hdr, metainfo->skb->data, swaHdr.tot_hdr_len);
 #else
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) && CONFIG_PPA_TCP_LITEPATH
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 	if (swaHdr.type != SW_ACC_TYPE_LTCP
 #if IS_ENABLED(CONFIG_LTQ_TOE_DRIVER) && CONFIG_LTQ_TOE_DRIVER 
 		&& swaHdr.type != SW_ACC_TYPE_LTCP_LRO 
@@ -695,7 +727,7 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 	}
 
 hdr_done:	
-#endif /* IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM) */
+#endif /* CONFIG_PPA_EXT_PKT_LEARNING */
 	p_item->session_meta=p_swaHdr;
 	swa_dump_skb(p_swaHdr->hdr, swaHdr.tot_hdr_len, 1);
 	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d allocated swacc template buffer\n", __FUNCTION__, __LINE__);
@@ -721,7 +753,7 @@ int32_t swac_add_routing_entry(PPA_ROUTING_INFO *route)
 	}
 #endif /* IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM) */
 
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 	/* local session = CPU_BOUND*/
 	if( (p_item->flag2 & SESSION_FLAG2_CPU_BOUND) ) {
 	/* in case of local in traffic*/
@@ -780,12 +812,11 @@ SKIP_PPPOE_TUNNEL_CHECK:
 
 static void del_swah(struct uc_session_node *p_item)
 {
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
-	t_sw_hdr *swa = NULL;
-#endif
 	if (p_item->session_meta) {
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
+		t_sw_hdr *swa = NULL;
+
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d del swah\n", __FUNCTION__, __LINE__);
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
 		swa = (t_sw_hdr*)(p_item->session_meta);
 		if((p_item->flag2 & SESSION_FLAG2_CPU_IN) && (swa->dst)) {
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d\n", __FUNCTION__, __LINE__);
@@ -906,6 +937,15 @@ static int flag_header_ipv4( struct flag_header *pFlagHdr, const unsigned char* 
 		isValid=flag_header_ipv6(pFlagHdr,data+sizeof(*iph), data_offset);
 		break;
 	}
+	case IPPROTO_IPIP: {
+		data_offset += sizeof(*iph);
+		pFlagHdr->is_inner_ipv6 = 0;
+		pFlagHdr->offset[PARSER_IPV6_INNER_OFFSET_IDX] = 0;
+		pFlagHdr->is_inner_ipv4 = 1;
+		pFlagHdr->offset[PARSER_IPV4_INNER_OFFSET_IDX] = data_offset;
+		isValid = flag_header_ipv4(pFlagHdr, data+sizeof(*iph), data_offset);
+		break;
+	}
 	default:
 		isValid = 0;
 		break;
@@ -941,7 +981,13 @@ static int flag_header_ipv6( struct flag_header *pFlagHdr,
 		pFlagHdr->offset[PARSER_IPV4_INNER_OFFSET_IDX] = data_offset;
 		isValid=flag_header_ipv4(pFlagHdr,data+sizeof(*ip6h), data_offset);
 		break;
-		}
+	}
+	//case NEXTHDR_DEST: // for DS-Lite
+	//	data_offset += sizeof(*ip6h);
+	//	data += sizeof(*ip6h);
+	//	if ()
+	//	ipv6_optlen(data);
+	//	break;
 	default:
 		isValid = 0;
 		break;
@@ -1063,9 +1109,9 @@ static int sw_mod_ipv4_skb( PPA_SKBUF *skb,
 	struct iphdr *iph=NULL;
 	
 	swa = (t_sw_hdr*)(p_item->session_meta);
-	
 	memcpy(&org_iph, skb->data, sizeof(org_iph));
-	/* skb has enough headroom available */	
+	/* skb has enough headroom available */
+
 
 	/* set the skb->data to the point where we can copy the new header which includes (ETH+VLAN*+PPPoE*+IP) 
 	*optional	*/
@@ -1153,9 +1199,9 @@ static int sw_mod_ipv6_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 	memcpy(&org_ip6, (struct ipv6hdr *)skb->data, sizeof(org_ip6));
 
 	swa = (t_sw_hdr*)(p_item->session_meta);
-	/* skb has enough headroom is available */	
+	/* skb has enough headroom is available */
 
-	/* set the skb->data to the point where we can copy the new header 
+	/* set the skb->data to the point where we can copy the new header
 	 which includes (ETH+VLAN*+PPPoE*+IP)	*/
 	skb_push(skb, swa->transport_offset - IPV6_HDR_LEN);
 
@@ -1163,11 +1209,11 @@ static int sw_mod_ipv6_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 	memcpy(skb->data, swa->hdr, swa->transport_offset);
 	/* set the skb pointers porperly*/
 	skb_set_mac_header(skb, 0);
-	skb_set_network_header(skb, swa->network_offset); 
+	skb_set_network_header(skb, swa->network_offset);
 	skb_set_transport_header(skb, swa->transport_offset);
 	ip6h = (struct ipv6hdr *)skb_network_header(skb);
 	
-	ip6h->hop_limit = org_ip6.hop_limit-1; 
+	ip6h->hop_limit = org_ip6.hop_limit-1;
 	ip6h->payload_len = org_ip6.payload_len;
 
 #if defined IPV6_NAT
@@ -1221,7 +1267,7 @@ static int sw_mod_ipv6_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 		inet_proto_csum_replace4(&tcph->check, skb, org_ip6.daddr.ip[2], ip6h->daddr.ip[2], 1);
 		inet_proto_csum_replace4(&tcph->check, skb, org_ip6.daddr.ip[3], ip6h->daddr.ip[3], 1);
 
-		if( p_item->pkt.nat_port && (p_item->flags & SESSION_VALID_NAT_PORT)) { 
+		if( p_item->pkt.nat_port && (p_item->flags & SESSION_VALID_NAT_PORT)) {
 			if( p_item->flags & SESSION_LAN_ENTRY ) {
 				inet_proto_csum_replace2(&tcph->check, skb, tcph->source, p_item->pkt.nat_port, 0);
 				tcph->source = p_item->pkt.nat_port;
@@ -1254,7 +1300,7 @@ static int sw_mod_dslite_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 	skb_push(skb, swa->tot_hdr_len);
 	memcpy(skb->data, swa->hdr, swa->tot_hdr_len);
 	skb_set_mac_header(skb, 0);
-	skb_set_network_header(skb, swa->network_offset); 
+	skb_set_network_header(skb, swa->network_offset);
 	skb_set_transport_header(skb, swa->transport_offset);
 	
 	if( IsLanSession(p_item->flags) ) {
@@ -1272,7 +1318,83 @@ static int sw_mod_dslite_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 	/* Decrment iph ttl */	
 	iph->ttl--;
 	iph->check = 0;
-	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl); 
+	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
+	/* TODO: DSCP marking ??? */
+	return ret;
+}
+
+static int sw_mod_ipip_skb(PPA_SKBUF *skb, struct uc_session_node *p_item)
+{
+	t_sw_hdr *swa;
+	struct iphdr org_iph;
+	struct iphdr *iph;
+	int ret = 0;
+
+	swa = (t_sw_hdr *)(p_item->session_meta);
+
+	memcpy(&org_iph, skb->data, sizeof(org_iph));
+
+	/*copy the header buffer to the packet*/
+	skb_push(skb, swa->tot_hdr_len);
+	memcpy(skb->data, swa->hdr, swa->tot_hdr_len);
+	skb_set_mac_header(skb, 0);
+	skb_set_network_header(skb, swa->network_offset);
+	skb_set_transport_header(skb, swa->transport_offset);
+
+	if (IsLanSession(p_item->flags)) {
+		struct iphdr *iph1;
+		iph1 = (struct iphdr *)skb_network_header(skb);
+		ret = iph1->tot_len = htons(ntohs(org_iph.tot_len) + IPV4_HDR_LEN);
+
+		iph1->check = 0;
+		iph1->check = ip_fast_csum((unsigned char *)iph1, iph1->ihl);
+		iph = (struct iphdr *)skb_transport_header(skb);
+	} else {
+		ret = ntohs(org_iph.tot_len);
+		iph = (struct iphdr *)skb_network_header(skb);
+	}
+
+	/* Decrment iph ttl */
+	iph->ttl--;
+	iph->check = 0;
+	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
+	/* TODO: DSCP marking ??? */
+	return ret;
+}
+
+static int sw_mod_ip6ip6_skb(PPA_SKBUF *skb, struct uc_session_node *p_item)
+{
+	t_sw_hdr *swa;
+	struct ipv6hdr org_ip6h;
+	struct ipv6hdr *ip6h;
+	int ret = 0;
+
+	swa = (t_sw_hdr *)(p_item->session_meta);
+
+	memcpy(&org_ip6h, skb->data, sizeof(org_ip6h));
+
+	/*copy the header buffer to the packet*/
+	skb_push(skb, swa->tot_hdr_len);
+	memcpy(skb->data, swa->hdr, swa->tot_hdr_len);
+	skb_set_mac_header(skb, 0);
+	skb_set_network_header(skb, swa->network_offset);
+	skb_set_transport_header(skb, swa->transport_offset);
+
+	if (IsLanSession(p_item->flags)) {
+		struct ipv6hdr *ip6h1;
+
+		ip6h1 = (struct ipv6hdr *)skb_network_header(skb);
+		ip6h1->payload_len = htons(ntohs(org_ip6h.payload_len)+IPV6_HDR_LEN+SZ_8);
+		ret = ntohs(ip6h1->payload_len) + IPV6_HDR_LEN + SZ_8;
+
+		ip6h = (struct ipv6hdr *)skb_transport_header(skb);
+	} else {
+		ret = htons(ntohs(org_ip6h.payload_len) + IPV6_HDR_LEN + SZ_8);
+		ip6h = (struct ipv6hdr *)skb_network_header(skb);
+	}
+
+	/* Decrement hop limit */
+	ip6h->hop_limit--;
 	/* TODO: DSCP marking ??? */
 	return ret;
 }
@@ -1292,7 +1414,7 @@ static int sw_mod_6rd_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 	skb_push(skb, swa->tot_hdr_len);
 	memcpy(skb->data, swa->hdr, swa->tot_hdr_len);
 	skb_set_mac_header(skb, 0);
-	skb_set_network_header(skb, swa->network_offset); 
+	skb_set_network_header(skb, swa->network_offset);
 	skb_set_transport_header(skb, swa->transport_offset);
 	
 	if( IsLanSession(p_item->flags) ) {
@@ -1303,7 +1425,7 @@ static int sw_mod_6rd_skb( PPA_SKBUF *skb, struct uc_session_node *p_item)
 		ret = iph->tot_len = htons(ntohs(org_ip6h.payload_len) + IPV6_HDR_LEN + IPV4_HDR_LEN);
 
 		iph->check = 0;
-		iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl); 
+		iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
 		ip6h = (struct ipv6hdr*)skb_transport_header(skb);
 	} else {
 		ret = htons(ntohs(org_ip6h.payload_len) + IPV6_HDR_LEN);
@@ -1572,15 +1694,17 @@ static sw_acc_type_fn afn_SoftAcceleration[SW_ACC_TYPE_MAX] = {
 	sw_mod_6rd_skb,
 	sw_mod_dslite_skb,
 	sw_mod_bridged_skb,
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 	sw_mod_ltcp_skb,
 #if IS_ENABLED(CONFIG_LTQ_TOE_DRIVER)
 	sw_mod_ltcp_skb_lro,
 #endif
 #endif
 #if defined(L2TP_CONFIG) && L2TP_CONFIG
-	sw_mod_l2tp_skb
+	sw_mod_l2tp_skb,
 #endif
+	sw_mod_ipip_skb,
+	sw_mod_ip6ip6_skb,
 };
 
 static int get_time_in_sec(void)
@@ -2180,16 +2304,6 @@ static int32_t swac_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uin
 		ppa_drv_deregister_cap(TUNNEL_DSLITE, SWAC_HAL);
 		ppa_drv_deregister_cap(TUNNEL_L2TP_US, SWAC_HAL);
 		ppa_drv_deregister_cap(TUNNEL_L2TP_DS, SWAC_HAL);
-		return res;
-	} 
-	case PPA_GENERIC_HAL_GET_HAL_VERSION: {
-		PPA_VERSION *v = (PPA_VERSION *)buffer;
-		strncpy(v->version, "1.0.0", 6);
-		return res;
-	}
-	case PPA_GENERIC_HAL_GET_PPE_FW_VERSION: {
-		PPA_VERSION *v=(PPA_VERSION *)buffer;
-		strncpy(v->version, "2.0.1", 6);
 		return res;
 	} 
 	case PPA_GENERIC_HAL_UPDATE_SESS_META: {

@@ -7,7 +7,7 @@
  ** DATE	: 20 Mar 2014
  ** AUTHOR	: Purnendu Ghosh
  ** DESCRIPTION	: MPE HAL Layer
- ** COPYRIGHT	: Copyright © 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright © 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2009, Lantiq Deutschland GmbH
  **	              Am Campeon 3; 85579 Neubiberg, Germany
  **
@@ -593,21 +593,6 @@ static int32_t mpe_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 		/* uninit the multicast template buffer hooks*/
 		ppa_tmplbuf_unregister_hooks();
 		return mpe_hal_deregister_caps();
-	}
-	case PPA_GENERIC_HAL_GET_HAL_VERSION: {
-		PPA_VERSION *v = (PPA_VERSION *)buffer;
-		strncpy(v->version, "1.0.1", 6);
-		return PPA_SUCCESS;
-	}
-	case PPA_GENERIC_HAL_GET_PPE_FW_VERSION: {
-		PPA_VERSION *v=(PPA_VERSION *)buffer;
-
-		v->family = g_GenConf->fw_hdr.family;
-		v->type = g_GenConf->fw_hdr.package;
-		v->major = g_GenConf->fw_hdr.v_maj;
-		v->mid = g_GenConf->fw_hdr.v_mid;
-		v->minor = g_GenConf->fw_hdr.v_min;
-		return PPA_SUCCESS;
 	}
 	case PPA_GENERIC_HAL_UPDATE_SESS_META: {
 		if (g_MPE_accl_mode) {

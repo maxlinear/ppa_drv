@@ -7,7 +7,7 @@
  ** DATE		: 3 NOV 2008
  ** AUTHOR		: Xu Liang
  ** DESCRIPTION		: PPA Protocol Stack Hook API Implementation
- ** COPYRIGHT		: Copyright © 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT		: Copyright © 2020-2025 MaxLinear, Inc.
  **                      Copyright (c) 2017 Intel Corporation
  **		         Lantiq Deutschland GmbH
  **			 Am Campeon 3; 85579 Neubiberg, Germany
@@ -21,34 +21,6 @@
  ** 10 DEC 2012	Manamohan Shetty	Added the support for RTP,MIB mode
  **									 Features
  *******************************************************************************/
-/*
- * ####################################
- *		Version No.
- * ####################################
- */
-#define VER_FAMILY		0x60		/*	bit 0: res*/
-/*		1: Danube
-//		2: Twinpass
-//		3: Amazon-SE
-//		4: res
-//		5: AR9
-//		6: GR9*/
-#define VER_DRTYPE		0x20		/*	bit 0: Normal Data Path driver
-//		1: Indirect-Fast Path driver
-//		2: HAL driver
-//		3: Hook driver
-//		4: Stack/System Adaption Layer driver
-//		5: PPA API driver*/
-#define VER_INTERFACE	 0x07		/*	bit 0: MII 0
-//		1: MII 1
-//		2: ATM WAN
-//		3: PTM WAN*/
-#define VER_ACCMODE	 0x03		/*	bit 0: Routing
-//		1: Bridging */
-#define VER_MAJOR	0
-#define VER_MID		0
-#define VER_MINOR	4
-
 #define ETHSW_INVALID_PORT 0xFF
 /*
  * ####################################
@@ -102,6 +74,7 @@
 #endif
 #include "ppa_api_mib.h"
 #include "ppa_stack_tnl_al.h"
+#include "ppa_drv_ver.h"
 
 /*
  * ####################################
@@ -109,6 +82,8 @@
  * ####################################
  */
 #define MIN_HITS	10
+#define PPA_TAG_CONVERT_TO_STRING(x) #x
+#define PPA_TAG_STRINGIFY(x) PPA_TAG_CONVERT_TO_STRING(x)
 
 #if IS_ENABLED(CONFIG_PPA_MPE_IP97)
 struct ipsec_tunnel_intf ipsec_tnl_info;
@@ -170,12 +145,6 @@ uint32_t g_ppa_min_hits = MIN_HITS;
 /*maximum frame size from ip header to end of the data payload, not including MAC header/pppoe header/vlan */
 uint32_t g_ppa_ppa_mtu=DEFAULT_MTU;
 
-/* PPA_SS_VERSION is taken from feed Makefile */
-#define PPA_SS_DEFAULT_VERSION	"0.0.0.0"
-#ifndef PPA_SS_VERSION
-#define PPA_SS_VERSION PPA_SS_DEFAULT_VERSION
-#endif
-const char g_ppa_ss_version[VERSION_STR_LEN] = PPA_SS_VERSION;
 /*
  * ####################################
  *			 Extern Variable
@@ -672,96 +641,22 @@ void ppa_api_exit(void)
  *	PPA Initialization Functions
  */
 
-void ppa_subsystem_id(uint32_t *p_family,
-		uint32_t *p_type,
-		uint32_t *p_if,
-		uint32_t *p_mode,
-		uint32_t *p_major,
+void ppa_get_ver_id(uint32_t *p_major,
 		uint32_t *p_mid,
 		uint32_t *p_minor,
-		uint32_t *p_tag)
+		char *p_tag)
 {
-	char *s_version = NULL, *token = NULL;
-	unsigned long u_version[VERSION_MAX] = {0, 0, 0, 0};
-	int version_index = 0, ret = PPA_SUCCESS;
-
-	if (p_family)
-		*p_family = 0;
-
-	if (p_type)
-		*p_type = 0;
-
-	if (p_if)
-		*p_if = 0;
-
-	if (p_mode)
-		*p_mode = 0;
-
-	s_version = (char *)ppa_malloc(VERSION_STR_LEN * sizeof(char *));
-	if (s_version == NULL)
-		goto exit_lbl;
-
-	ppa_memset(s_version, '\0', VERSION_STR_LEN);
-	ppa_strncpy(s_version, g_ppa_ss_version, strnlen(g_ppa_ss_version, VERSION_STR_LEN) + 1);
-
-	token = strsep(&s_version, ".");
-	while (token != NULL) {
-		ret = kstrtoul(token, 10, &u_version[version_index]);
-		if (ret != PPA_SUCCESS) {
-			ppa_debug(DBG_ENABLE_MASK_ERR, "<%s> Invalid version number!\n", __FUNCTION__);
-		}
-		version_index++;
-		token = strsep(&s_version, ".");
-	}
-
 	if (p_major)
-		*p_major = u_version[VERSION_MAJOR];
+		*p_major = PPA_VER_MAJ;
 
 	if (p_mid)
-		*p_mid = u_version[VERSION_MID];
+		*p_mid = PPA_VER_MID;
 
 	if (p_minor)
-		*p_minor = u_version[VERSION_MINOR];
+		*p_minor = PPA_VER_MIN;
 
 	if (p_tag)
-		*p_tag = u_version[VERSION_TAG];
-
-	if (strncmp(g_ppa_ss_version, PPA_SS_DEFAULT_VERSION, VERSION_STR_LEN - 1) == 0)
-		ppa_debug(DBG_ENABLE_MASK_ERR, "<%s> PPA Subsystem Version is NOT defined !\n", __FUNCTION__);
-
-exit_lbl:
-	if (s_version != NULL)
-		ppa_free(s_version);
-}
-
-void ppa_get_api_id(uint32_t *p_family,
-		uint32_t *p_type,
-		uint32_t *p_if,
-		uint32_t *p_mode,
-		uint32_t *p_major,
-		uint32_t *p_mid,
-		uint32_t *p_minor)
-{
-	if (p_family)
-		*p_family = VER_FAMILY;
-
-	if (p_type)
-		*p_type = VER_DRTYPE;
-
-	if (p_if)
-		*p_if = VER_INTERFACE;
-
-	if (p_mode)
-		*p_mode = VER_ACCMODE;
-
-	if (p_major)
-		*p_major = VER_MAJOR;
-
-	if (p_mid)
-		*p_mid = VER_MID;
-
-	if (p_minor)
-		*p_minor = VER_MINOR;
+		ppa_strncpy(p_tag, PPA_TAG_STRINGIFY(PPA_VER_TAG), PPA_VERSION_LEN);
 }
 
 int32_t ppa_init(PPA_INIT_INFO *p_info, uint32_t flags)
@@ -771,8 +666,11 @@ int32_t ppa_init(PPA_INIT_INFO *p_info, uint32_t flags)
 	if (!p_info)
 		return PPA_EINVAL;
 
-	if (ppa_is_init())
-		ppa_exit();
+	if (ppa_is_init()) {
+		ret = ppa_exit();
+		if (ret)
+			return PPA_SUCCESS;
+	}
 
 	if ((ret = ppa_init_new(p_info, flags)) == PPA_SUCCESS)
 		printk("ppa_init - init succeeded\n");
@@ -790,14 +688,14 @@ int32_t ppa_init(PPA_INIT_INFO *p_info, uint32_t flags)
 	return ret;
 }
 
-void ppa_exit(void)
+int32_t ppa_exit(void)
 {
 	PPA_HAL_ID i;
 
 #if IS_ENABLED(CONFIG_QOS_TC)
 	/* Don't exit ppa if tc-qos is configured on logical interfces */
-	if (ppa_api_netif_tc_qos_config_check() != PPA_SUCCESS)
-		return;
+	if (ppa_api_netif_tc_qos_config_check())
+		return PPA_EBUSY;
 #endif
 
 	if (ppa_is_init()) {
@@ -807,6 +705,7 @@ void ppa_exit(void)
 		}
 		ppa_api_exit();
 	}
+	return PPA_SUCCESS;
 }
 
 /*
@@ -2314,6 +2213,7 @@ int32_t ppa_add_if(PPA_IFINFO *ifinfo, uint32_t flags)
 				ifinfo->force_wanitf_flag);
 	return ret;
 }
+EXPORT_SYMBOL(ppa_add_if);
 
 int32_t ppa_del_if(PPA_IFINFO *ifinfo, uint32_t flags)
 {
@@ -2395,6 +2295,7 @@ int32_t ppa_del_if(PPA_IFINFO *ifinfo, uint32_t flags)
 
 	return PPA_SUCCESS;
 }
+EXPORT_SYMBOL(ppa_del_if);
 
 int32_t ppa_get_if(int32_t *num_ifs, PPA_IFINFO **ifinfo, uint32_t flags)
 {
@@ -2646,13 +2547,3 @@ int32_t ppa_update_min_hit(uint32_t val)
 		pr_err("Given value %u less than %d!!\n", val, MIN_HITS);
 	return PPA_SUCCESS;
 }
-
-EXPORT_SYMBOL(ppa_init);
-EXPORT_SYMBOL(ppa_exit);
-EXPORT_SYMBOL(ppa_enable);
-EXPORT_SYMBOL(ppa_add_if);
-EXPORT_SYMBOL(ppa_del_if);
-EXPORT_SYMBOL(ppa_get_max_entries);
-EXPORT_SYMBOL(ppa_ip_sprintf);
-EXPORT_SYMBOL(ppa_ip_comare);
-EXPORT_SYMBOL(ppa_zero_ip);

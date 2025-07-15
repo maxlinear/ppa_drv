@@ -7,7 +7,7 @@
 ** DATE     : 10 JUN 2008
 ** AUTHOR     : Mark Smith
 ** DESCRIPTION  : PPA (Routing Acceleration) User Configuration Utility
-** COPYRIGHT  : Copyright (c) 2020-2024 MaxLinear, Inc.
+** COPYRIGHT  : Copyright (c) 2020-2025 MaxLinear, Inc.
 **              Copyright (c) 2009, Lantiq Deutschland GmbH
 **              Am Campeon 3; 85579 Neubiberg, Germany
 **
@@ -3793,195 +3793,13 @@ static void ppa_del_all_vfilter_help( int summary)
 */
 static void ppa_get_version_help( int summary)
 {
-	IFX_PPACMD_PRINT("getversion [ -a ]\n"); // [ -m <multicast-mac-address (for bridging only)>]
+	IFX_PPACMD_PRINT("getversion \n");
 	return;
 }
 
-PPA_VERSION ppa_api_ver;
-PPA_VERSION ppa_stack_al_ver;
-PPA_VERSION ppe_hal_ver;
-PPA_VERSION ppe_fw_ver;
-char *ppe_fw_ver_family_str[] = /*Platfrom of PPE FW */
-{
-    "Reserved",
-    "Danube",
-    "Twinpass",
-    "Amazon-SE",
-    "Reserved",
-    "AR9",
-    "GR9",
-    "VR9",
-    "AR10",
-    "VRX318",
-};
-char *ppe_fw_ver_interface_str[] =
-{
-    "D4", // 0
-    "D5", // 1
-    "A4", // 2
-    "E4", // 3
-    "A5", // 4
-    "E5",  // 5
-    "Res",  // 6: reserved
-    "D5"  // 7: in VR9 D5+Bonding fw, it is set to this value. So here we set it to D5
-};
-
-char *ppe_fw_ver_package_str[] = 
-{
-	"Reserved - 0",
-	"A1",
-	"B1 - PTM_BONDING",
-	"E1",
-	"A5",
-	"D5",
-	"D5v2",
-	"E5",
-};
-
-char *ppe_drv_ver_family_str[] =   /* Network processor platfrom */
-{
-    "Reserved",  //bit 0, ie, value 0x1
-    "Danube",  //bit 1, ie, value 0x2
-    "Twinpass",  //bit 2, ie, value 0x4
-    "Amazon-SE", //bit 3, ie, value 0x8
-    "Reserved",  //bit 4, ie, value 0x10
-    "AR9",       //bit 5  , ie, value 0x20
-    "VR9",      //bit 6, ie, value 0x40
-    "AR10",     //bit 7, ie, value 080
-};
-
-//get the non-zero high bit index ( from zero )
-static int ppa_get_platform_id(uint32_t family)
-{
-    /*very one bit repreents one platform */
-    int i;
-
-    for(i=31; i>=0; i--)
-        if( family & (1<<i) ) return i;
-
-    return 0;
-}
-
-typedef enum {
-    DSL_ATM_MODE=1,
-    DSL_PTM_MODE
-}dsl_mode;
-
 static void ppa_print_get_version_cmd(PPA_CMD_DATA *pdata)
 {
-#ifndef CONFIG_SOC_GRX500
-    int i;
-    int k, num,id, dsl_atm_ptm=0;
-#endif
- 
-	IFX_PPACMD_PRINT("PPA SubSystem version info:v%u.%u.%u-%u\n", (unsigned int)pdata->ver.ppa_subsys_ver.major, (unsigned int)pdata->ver.ppa_subsys_ver.mid, (unsigned int)pdata->ver.ppa_subsys_ver.minor, (unsigned int)pdata->ver.ppa_subsys_ver.tag );
-	IFX_PPACMD_PRINT("  PPA ppacmd utility tool info:%u.%u.%u\n", PPACMD_VERION_MAJOR, PPACMD_VERION_MID, PPACMD_VERION_MINOR);
-	IFX_PPACMD_PRINT("  PPA API driver info:%u.%u.%u.%u.%u.%u.%u\n", (unsigned int)pdata->ver.ppa_api_ver.family, (unsigned int)pdata->ver.ppa_api_ver.type, (unsigned int)pdata->ver.ppa_api_ver.itf, (unsigned int)pdata->ver.ppa_api_ver.mode, (unsigned int)pdata->ver.ppa_api_ver.major, (unsigned int)pdata->ver.ppa_api_ver.mid, (unsigned int)pdata->ver.ppa_api_ver.minor);
-	IFX_PPACMD_PRINT("  PPA Stack Adaption Layer driver info:%u.%u.%u.%u.%u.%u.%u\n", (unsigned int)pdata->ver.ppa_stack_al_ver.family, (unsigned int)pdata->ver.ppa_stack_al_ver.type, (unsigned int)pdata->ver.ppa_stack_al_ver.itf, (unsigned int)pdata->ver.ppa_stack_al_ver.mode, (unsigned int)pdata->ver.ppa_stack_al_ver.major, (unsigned int)pdata->ver.ppa_stack_al_ver.mid, (unsigned int)pdata->ver.ppa_stack_al_ver.minor);
-
-
-#ifdef CONFIG_SOC_GRX500
-	IFX_PPACMD_PRINT("  PAE HAL driver info:%u.%u.%u.%u.%u.%u.%u\n", (unsigned int)pdata->ver.ppe_hal_ver.family, (unsigned int)pdata->ver.ppe_hal_ver.type, (unsigned int)pdata->ver.ppe_hal_ver.itf, (unsigned int)pdata->ver.ppe_hal_ver.mode, (unsigned int)pdata->ver.ppe_hal_ver.major, (unsigned int)pdata->ver.ppe_hal_ver.mid, (unsigned int)pdata->ver.ppe_hal_ver.minor);
-        
-	IFX_PPACMD_PRINT("  MPE HAL driver info:%u.%u.%u.%u.%u.%u.%u\n", (unsigned int)pdata->ver.mpe_hal_ver.family, (unsigned int)pdata->ver.mpe_hal_ver.type, (unsigned int)pdata->ver.mpe_hal_ver.itf, (unsigned int)pdata->ver.mpe_hal_ver.mode, (unsigned int)pdata->ver.mpe_hal_ver.major, (unsigned int)pdata->ver.mpe_hal_ver.mid, (unsigned int)pdata->ver.mpe_hal_ver.minor);
-	
-	IFX_PPACMD_PRINT("  MPE FW version:%u.%u.%u.%u.%u\n", (unsigned int)pdata->ver.ppe_fw_ver[1].family, (unsigned int)pdata->ver.ppe_fw_ver[1].type, (unsigned int)pdata->ver.ppe_fw_ver[1].major, (unsigned int)pdata->ver.ppe_fw_ver[1].mid, (unsigned int)pdata->ver.ppe_fw_ver[1].minor);
-
-#else
-	IFX_PPACMD_PRINT("  PPE HAL driver info:%u.%u.%u.%u.%u.%u.%u\n", (unsigned int)pdata->ver.ppe_hal_ver.family, (unsigned int)pdata->ver.ppe_hal_ver.type, (unsigned int)pdata->ver.ppe_hal_ver.itf, (unsigned int)pdata->ver.ppe_hal_ver.mode, (unsigned int)pdata->ver.ppe_hal_ver.major, (unsigned int)pdata->ver.ppe_hal_ver.mid, (unsigned int)pdata->ver.ppe_hal_ver.minor);
-	id=ppa_get_platform_id(pdata->ver.ppe_hal_ver.family);
-	if (id < NUM_ENTITY(ppe_drv_ver_family_str) )
-	{
-		IFX_PPACMD_PRINT("  PPE Driver Platform:%s\n", ppe_drv_ver_family_str[id] );
-	}
-	else
-	{
-		IFX_PPACMD_PRINT("PPE Driver Platform :unknown (0x%x)\n",  (unsigned int)pdata->ver.ppa_stack_al_ver.family);
-	}
-	num = 0;
-	for(k=0; k<2; k++ )
-	{
-		if( pdata->ver.ppe_fw_ver[k].family == 0 )
-		{
-			if( k ==0 && pdata->ver.ppe_fw_ver[1].family != 0 )
-			{ // For VR9 D5 Ethernet wan mode, only PPE FW 1 is working, PE FW 0 not running at all
-				//note, so far only VR9 E5 are using two PPE. So here we harded some information here for E5 ethernet WAN mode
-				IFX_PPACMD_PRINT("  PPE0 FW Mode: %s family %s (not running now)\n", ppe_fw_ver_family_str[7], ppe_fw_ver_interface_str[5]);
-			}
-			continue;
-		}
-		IFX_PPACMD_PRINT("  PPE%d FW version:%u.%u.%u.%u.%u\n", k, (unsigned int)pdata->ver.ppe_fw_ver[k].family, (unsigned int)pdata->ver.ppe_fw_ver[k].type, (unsigned int)pdata->ver.ppe_fw_ver[k].major, (unsigned int)pdata->ver.ppe_fw_ver[k].mid, (unsigned int)pdata->ver.ppe_fw_ver[k].minor);
-
-		IFX_PPACMD_PRINT("  PPE%d FW Mode:", k);
-		if( pdata->ver.ppe_fw_ver[k].family < NUM_ENTITY(ppe_fw_ver_family_str) )
-		{
-			IFX_PPACMD_PRINT("%s family ", ppe_fw_ver_family_str[pdata->ver.ppe_fw_ver[k].family] );
-		}
-		else
-		{
-			IFX_PPACMD_PRINT("unknown family(%d)",  (unsigned int)pdata->ver.ppe_fw_ver[k].family);
-		}
-		if(pdata->ver.ppe_fw_ver[k].type < NUM_ENTITY(ppe_fw_ver_package_str)){
-				IFX_PPACMD_PRINT(" %s", ppe_fw_ver_package_str[pdata->ver.ppe_fw_ver[k].type] );
-		}else{
-			IFX_PPACMD_PRINT(" unknown package(%d) with ppe_fw_ver_package_str[%d] ", (unsigned int)pdata->ver.ppe_fw_ver[k].type,  (unsigned int)NUM_ENTITY(ppe_fw_ver_package_str));
-		}
-		if( k == 0 ) { //adapt for VRX318 from ppe_fw_ver_package_str
-			if( pdata->ver.ppe_fw_ver[k+1].type == 2 /*B1-PTM Bonding: E1 w/ Bonding */ || pdata->ver.ppe_fw_ver[k+1].type == 3 /*E1 w/o bonding */ )
-				dsl_atm_ptm=DSL_PTM_MODE; //PTM
-			else if( pdata->ver.ppe_fw_ver[k+1].type == 1 /*A1*/||
-					pdata->ver.ppe_fw_ver[k+1].type == 10 /*support wrong value in current VRX318 */)
-				dsl_atm_ptm=DSL_ATM_MODE; //PTM
-		}
-		IFX_PPACMD_PRINT("\n");
-		IFX_PPACMD_DBG("PPE%d package=%d with dsl_atm_ptm=%d\n", k, pdata->ver.ppe_fw_ver[k].type, dsl_atm_ptm );
-
-		if( num ) continue; //only print once for below messages
-		num ++;
-
-		IFX_PPACMD_DBG("  wan_port_map=%u mixed=%u\n", (unsigned int)pdata->ver.ppa_wan_info.wan_port_map, (unsigned int)pdata->ver.ppa_wan_info.mixed );
-		//display wan interfaces in PPE FW
-		IFX_PPACMD_PRINT("  PPE WAN interfaces: ");
-		for(i=0; i<8; i++)
-		{
-			if( pdata->ver.ppa_wan_info.wan_port_map & (1<<i) )
-			{
-				char dsl_mode[10]={0};
-				if( dsl_atm_ptm == DSL_ATM_MODE ) strcpy_s(dsl_mode,10, "(ATM)");
-				else if( dsl_atm_ptm == DSL_PTM_MODE ) strcpy_s(dsl_mode,10, "(PTM)");
-				if( i == 0 || i== 1 ) IFX_PPACMD_PRINT("eth%d ", i);
-				else if( i >=2  && i<6 ) IFX_PPACMD_PRINT("ext%d ", i-2);
-				else if( i ==6 || i==7 ) IFX_PPACMD_PRINT("DSL%s ", dsl_mode);
-			}
-		}
-		IFX_PPACMD_PRINT("\n");
-
-        }
-        IFX_PPACMD_PRINT("  PPA IPV6:%s(ppe:%s/ppa:%s)\n", pdata->ver.ppe_fw_feature.ipv6_en & pdata->ver.ppa_feature.ipv6_en ? "enabled":"disabled",
-                         pdata->ver.ppe_fw_feature.ipv6_en ? "enabled":"disabled",
-                         pdata->ver.ppa_feature.ipv6_en ? "enabled":"disabled" );
-#ifdef PPACMD_DEBUG_QOS
-        IFX_PPACMD_PRINT("  PPA QOS:%s(ppe:%s/ppa:%s)\n", pdata->ver.ppe_fw_feature.qos_en & pdata->ver.ppa_feature.qos_en ? "enabled":"disabled",
-                         pdata->ver.ppe_fw_feature.qos_en ? "enabled":"disabled",
-                         pdata->ver.ppa_feature.qos_en ? "enabled":"disabled" );
-#endif
-
-
-        if( g_all )
-        {
-            int ioctl_cmd;
-            PPA_CMD_DATA tmp_pdata;
-			
-            ioctl_cmd =PPA_CMD_GET_STATUS;
-            ppa_memset( &tmp_pdata, sizeof(tmp_pdata), 0 );
-            if( ppa_do_ioctl_cmd( ioctl_cmd, &tmp_pdata) == PPA_SUCCESS ) ppa_print_status( &tmp_pdata);
-            
-            system( "[ -e /proc/driver/ifx_cgu/clk_setting ] && cat /proc/driver/ifx_cgu/clk_setting > /tmp/clk.txt" );
-            system( "[ -e /tmp/clk.txt ] && cat /tmp/clk.txt && rm /tmp/clk.txt" );
-
-
-        }
-#endif
+	IFX_PPACMD_PRINT("PPA-DRV version info:v%u.%u.%u.%s\n", (unsigned int)pdata->ver.ppa_ver.major, (unsigned int)pdata->ver.ppa_ver.mid, (unsigned int)pdata->ver.ppa_ver.minor, pdata->ver.ppa_ver.tag );
 }
 
 /*get bridge mac count */

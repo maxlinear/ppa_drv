@@ -46,7 +46,7 @@ typedef enum {
 	SW_ACC_TYPE_6RD,
 	SW_ACC_TYPE_DSLITE,
 	SW_ACC_TYPE_BRIDGED,
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 	SW_ACC_TYPE_LTCP,
 #if IS_ENABLED(CONFIG_LTQ_TOE_DRIVER)
 	SW_ACC_TYPE_LTCP_LRO,
@@ -55,6 +55,8 @@ typedef enum {
 #if defined(L2TP_CONFIG) && L2TP_CONFIG
 	SW_ACC_TYPE_L2TP,
 #endif
+	SW_ACC_TYPE_IPIP,
+	SW_ACC_TYPE_IP6IP6,
 	SW_ACC_TYPE_MAX
 }sw_acc_type;
 
@@ -65,7 +67,7 @@ typedef struct sw_header {
 	sw_acc_type type;            /* Software acceleration type */
 	PPA_NETIF *tx_if;            /* Out interface */
 	int (*tx_handler)(PPA_SKBUF *skb); /* tx handler function */
-#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
+#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH) || IS_ENABLED(CONFIG_PPA_UDP_LITEPATH)
 	struct dst_entry *dst;       /* route entry */
 #endif
 	uint8_t hdr[0];              /* Header to be copied */
