@@ -7,7 +7,7 @@
  ** DATE		 : 3 NOV 2008
  ** AUTHOR	   : Xu Liang
  ** DESCRIPTION  : PPA Protocol Stack Hook API Network Interface Functions
- ** COPYRIGHT	: Copyright © 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright © 2020-2025 MaxLinear, Inc.
  **               Copyright (c) 2009, Lantiq Deutschland GmbH
  **               Am Campeon 3; 85579 Neubiberg, Germany
  **
@@ -774,6 +774,7 @@ static void ppa_unregister_new_netif(PPA_NETIF *netif)
 	PPA_IFNAME *ifname = NULL;
 	struct netif_info *p_ifinfo = NULL;
 	int f_is_lan = 0;
+	bool del_netif = false;
 
 	phy_ifname[0] = 0;
 
@@ -815,13 +816,10 @@ static void ppa_unregister_new_netif(PPA_NETIF *netif)
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
 				"Removing logical wifi interface [%s]\n", ifname);
 		}
-		/* Physical netif removed from system.
-		 * So assigning NULL to PPA netif entry.
-		 */
-		p_ifinfo->netif = NULL;
-		ppa_netif_put(p_ifinfo);
+		del_netif = true;
 	}
-	if (ppa_if_is_br_if(netif, NULL)) {
+
+	if ((ppa_if_is_br_if(netif, NULL)) || (netif && ppa_dev_is_br(netif))) {
 		ppa_netif_remove(ifname, f_is_lan);
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
 			  "dynamically removing bridge[%s]\n", ifname);
@@ -834,6 +832,12 @@ static void ppa_unregister_new_netif(PPA_NETIF *netif)
 		ppa_netif_remove(ifname, f_is_lan);
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
 			  "dynamically removing WAN iface[%s]\n", ifname);
+	}
+
+	if (del_netif) {
+		/* netdev removed from system — assigning NULL to PPA netif entry */
+		p_ifinfo->netif = NULL;
+		ppa_netif_put(p_ifinfo);
 	}
 }
 
@@ -1115,7 +1119,7 @@ static void ppa_netif_up(PPA_NETIF *netif)
 					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "ppa_netif_add %s fail\n", ifname);
 			}
 		} else {
-			ppa_debug(DBG_ENABLE_MASK_ERR,
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
 				"%s : dp_get_netif_subifid Failed ifname: %s\n", __func__, ifname);
 		}
 		ppa_free(dp_subif);
@@ -2498,7 +2502,7 @@ static void __ppa_netif_remove(struct netif_info *p_ifinfo)
 			}
 #endif /* CONFIG_PPA_EXT_PKT_LEARNING */
 		} else {
-			ppa_debug(DBG_ENABLE_MASK_ERR,
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
 				"Get %s netif failed!!\n",
 				p_ifinfo->phys_netif_name);
 		}

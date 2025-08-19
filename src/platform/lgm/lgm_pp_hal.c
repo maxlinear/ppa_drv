@@ -510,6 +510,9 @@ static uint64_t nsess_add_fail_rt_tbl_full=0;
 static uint64_t nsess_add_fail_coll_full=0;
 static uint32_t nsess_add_fail_oth=0;
 
+/* FIXME: API for CPU queues */
+static int cpu_qmap[4] = {2, 4, 6, 8};
+
 #if defined(PPA_API_PROC)
 static struct dentry *ppa_ppv4hal_debugfs_dir;
 static struct dentry *ppa_fbm_debugfs_dir;
@@ -899,10 +902,11 @@ static inline uint16_t get_cpu_portinfo(void)
 	return 16;
 }
 
-static inline uint16_t get_cpu_qid(void)
+inline uint16_t get_cpu_qid(int cpu)
 {
-	/*TBD: this api shall call dp to retrieve the correct CPU queueid*/
-	return 2;
+	if (cpu < nr_cpu_ids)
+		return cpu_qmap[cpu];
+	return 0;
 }
 
 #define mc_ig_dst(ig_gid, ig_dstid)	\
@@ -1531,7 +1535,7 @@ static inline int32_t init_tdox_nf(void)
 	nf_info.subif = ppa_get_lp_subif();
 
 	/* cpu qid for lro */
-	q_logic.q_id = get_cpu_qid();
+	q_logic.q_id = get_cpu_qid(smp_processor_id());
 
 	/* physical to logical qid */
 	if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
@@ -4587,9 +4591,6 @@ static int pktprs_push_dummy_eth_header(struct pktprs_hdr *h)
 	return 0;
 }
 
-/* FIXME: API for CPU queues */
-static int cpu_qmap[4] = {2, 4, 6, 8};
-
 int32_t add_supportive_hw_route_entry(PPA_ROUTING_INFO *route)
 {
 	int32_t ret = 0;
@@ -4634,7 +4635,7 @@ int32_t add_supportive_hw_route_entry(PPA_ROUTING_INFO *route)
 	for (i = 0; i < ARRAY_SIZE(rt_entry.tbm); i++)
 		rt_entry.tbm[i] = PP_TBM_INVALID;
 
-	q_logic.q_id = cpu_qmap[smp_processor_id()];
+	q_logic.q_id = get_cpu_qid(smp_processor_id());
 
 	if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
 		pr_err("%s:%d ERROR Failed to Logical Queue Id\n",
@@ -4949,9 +4950,8 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 
 				if (p_item->flags & SESSION_IS_TCP) {
 					/*Set the session flags */
-					if (is_hw_litepath_enabled()) {
+					if (is_hw_litepath_enabled())
 						set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
-					}
 					lro_entry.lro_type = LRO_TYPE_TCP;
 					/*check mptcp options and if yes set
 					lro_entry.lro_type = LRO_TYPE_MPTCP;
@@ -4994,6 +4994,9 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 						dbg("%s Unsupported protocol:%x", __func__, ntohs(desc->skb->protocol));
 						return PPA_FAILURE;
 					}
+					if (is_hw_litepath_enabled())
+						set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
+
 					lro_entry.lro_type = LRO_TYPE_UDP;
 					if (unlikely(!sk)) {
 						dbg("%s invalid socket!", __func__);
@@ -5031,7 +5034,7 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 					dbg("lro entry add failed\n");
 					rt_entry.eg_port = get_cpu_portinfo();
 					rt_entry.tmp_ud_sz = COPY_16BYTES;
-					q_logic.q_id = get_cpu_qid();
+					q_logic.q_id = get_cpu_qid(smp_processor_id());
 
 					if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
 						pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
@@ -5051,7 +5054,7 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 non_lro_ppv4_session:
 				rt_entry.eg_port = get_cpu_portinfo();
 				rt_entry.tmp_ud_sz = COPY_16BYTES;
-				q_logic.q_id = get_cpu_qid();
+				q_logic.q_id = get_cpu_qid(smp_processor_id());
 				dbg("[%s] q_logic.q_id = %d q_logic.q_logic_id = %d\n",__func__, q_logic.q_id, q_logic.q_logic_id);
 				if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
 					pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
@@ -5070,6 +5073,15 @@ non_lro_ppv4_session:
 				if (!(p_item->flag2 & SESSION_FLAG2_LRO)) {
 					rt_entry.dst_q = ppa_get_lp_qid();
 					rt_entry.dst_q_high = -1;
+				}
+				if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags)) {
+					q_logic.q_id = get_cpu_qid(smp_processor_id());
+					if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
+						pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
+						ppa_free(dp_port);
+						return PPA_FAILURE;
+					}
+					pp_lro_q_set(q_logic.q_logic_id);
 				}
 			}
 #endif /*IS_ENABLED(LITEPATH_HW_OFFLOAD)*/
@@ -5373,6 +5385,8 @@ non_lro_ppv4_session:
 								PKTPRS_HDR_LEVEL0);
 					pp_hal_db[session_id].lp_rxinfo->proto =
 						p_item->pkt.protocol;
+					pp_hal_db[session_id].lp_rxinfo->ip_proto =
+						p_item->pkt.ip_proto;
 					pp_hal_db[session_id].lp_rxinfo->lro_sessid =
 						p_item->lro_sessid;
 				} else if (p_item->flag2 & SESSION_FLAG2_CPU_OUT) {

@@ -43,7 +43,8 @@
 #define PPA_SESSION_FILTER_SPORT 0x0002
 #define PPA_SESSION_FILTER_DPORT 0x0004
 typedef struct {
-	struct list_head list;
+	struct list_head 	list;
+	struct rcu_head 	rcu;
 	uint16_t		ip_proto;			/* IP prorocol */
 	uint16_t		src_port;			/* Source port */
 	uint16_t		dst_port;			/* Destination port */

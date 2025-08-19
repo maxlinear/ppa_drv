@@ -823,7 +823,6 @@ uint16_t str_to_num(char *str)
 
 static int proc_read_session_filter(struct seq_file *seq, void *v)
 {
-	struct list_head *list_node = NULL;
 	FILTER_INFO *filter_node = NULL;
 	int i = 0, j = 0;;
 
@@ -833,21 +832,22 @@ static int proc_read_session_filter(struct seq_file *seq, void *v)
 		seq_printf(seq, "------------------------------------------------\n");
 		seq_printf(seq, "  PPA Session Filtered List\n");
 		seq_printf(seq, "------------------------------------------------\n\n");
+		rcu_read_lock();
 		for (i=0; i< MAX_HAL + 1; i++) {
 			if (g_session_filter_list[i]) {
-			seq_printf(seq, "Session Filter List for %s HAL\n",value_to_str(i, axhals));
-			j = 1;
-			list_for_each(list_node, g_session_filter_list[i]) {
-				filter_node = list_entry(list_node, FILTER_INFO, list);
-				seq_printf(seq, "  %2d. Proto: %s, SrcPort: %d, DestPort:%d, hit:%d\n",
-						j, value_to_str(filter_node->ip_proto, axproto), filter_node->src_port,
-						filter_node->dst_port, filter_node->hit_cnt);
-				j++;
-			}
-			seq_printf(seq, "\n");
+				seq_printf(seq, "Session Filter List for %s HAL\n",value_to_str(i, axhals));
+				j = 1;
+				list_for_each_entry_rcu(filter_node, g_session_filter_list[i], list) {
+					seq_printf(seq, "  %2d. Proto: %s, SrcPort: %d, DestPort:%d, hit:%d\n",
+							j, value_to_str(filter_node->ip_proto, axproto), filter_node->src_port,
+							filter_node->dst_port, filter_node->hit_cnt);
+					j++;
+				}
+				seq_printf(seq, "\n");
 			}
 		}
 		seq_printf(seq, "------------------------------------------------\n\n");
+		rcu_read_unlock();
 	}
 	return 0;
 }

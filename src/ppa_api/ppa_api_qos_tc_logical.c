@@ -5,7 +5,7 @@
  * MODULES	: PPA framework support for qos-tc.
  *
  * DESCRIPTION	: QoS-TC adaptation for Logical interfaces support.
- * COPYRIGHT	: Copyright (C) 2023-2024 MaxLinear Inc.
+ * COPYRIGHT	: Copyright (C) 2023-2025 MaxLinear Inc.
  *
  * For licensing information, see the file 'LICENSE' in the root folder
  * of this software module.
@@ -597,7 +597,7 @@ int32_t ppa_qos_tc_setup(struct net_device *dev, enum tc_setup_type type,
 {
 	struct qos_tc_params tc_params = {0};
 	struct netif_info *p_ifinfo = NULL;
-	int32_t ret;
+	int32_t ret = PPA_FAILURE;
 
 	if (ppa_get_netif_info(dev->name, &p_ifinfo) != PPA_SUCCESS || !p_ifinfo) {
 		ppa_debug(DBG_ENABLE_MASK_ERR, "%s: Failed to get p_ifinfo for %s\n",

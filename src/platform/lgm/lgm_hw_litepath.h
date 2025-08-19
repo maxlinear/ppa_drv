@@ -36,6 +36,7 @@
 struct lp_info {
 	bool is_pppoe;			/* if packet is pppoe */
 	uint16_t proto;			/* l2 proto */
+	uint16_t ip_proto;		/* l3 proto */
 	uint8_t l3_offset;		/* ip layer offset*/
 	uint8_t l4_offset;		/* transport layer offset*/
 	struct dst_entry *dst;		/* route entry */

@@ -104,35 +104,41 @@ static fid_info		*fid_list=NULL;
 static uint32_t		g_next_fid=0;
 
 #endif
-static FILTER_INFO axglobal_filters[]={
-	{{0}, PPA_IPPROTO_UDP, 0, 53, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 53, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_TCP, 0, 53, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_TCP, 53, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_UDP, 5353, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_UDP, 1900, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_UDP, 0, 137, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 137, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_TCP, 0, 137, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_TCP, 137, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_UDP, 0, 138, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 138, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
-	{{0}, PPA_IPPROTO_UDP, 0,  67, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 0,  68, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 0, 547, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 0, 546, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_UDP, 2427, 0,(PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* mgcp for the Gateways */
-	{{0}, PPA_IPPROTO_UDP, 0, 2427,(PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* mgcp for Call Agents */
-	{{0}, PPA_IPPROTO_UDP, 0, 161, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* snmp */
-	{{0}, PPA_IPPROTO_UDP, 161, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* snmp */
-	{{0}, PPA_IPPROTO_UDP, 0, 162, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* snmptrap */
-	{{0}, PPA_IPPROTO_UDP, 162, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* snmptrap */
+static FILTER_INFO axglobal_filters[] = {
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 53, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 53, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_TCP, 0, 53, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_TCP, 53, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 5353, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 1900, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 137, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 137, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_TCP, 0, 137, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_TCP, 137, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 138, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 138, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 0,  67, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 0,  68, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 547, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 546, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_UDP, 2427, 0,(PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* mgcp for the Gateways */
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 2427,(PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* mgcp for Call Agents */
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 161, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* snmp */
+	{{0}, {0}, PPA_IPPROTO_UDP, 161, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* snmp */
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 162, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* snmptrap */
+	{{0}, {0}, PPA_IPPROTO_UDP, 162, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* snmptrap */
+	{{0}, {0}, PPA_IPPROTO_UDP, 5060, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* SIP */
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 5060, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* SIP */
+	{{0}, {0}, PPA_IPPROTO_UDP, 5061, 0, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_SPORT)}, /* secure SIP */
+	{{0}, {0}, PPA_IPPROTO_UDP, 0, 5061, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)}, /* secure SIP */
 };
-static FILTER_INFO axsae_filters[]={
-	{{0}, PPA_IPPROTO_TCP, 0, 443, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
-	{{0}, PPA_IPPROTO_TCP, 0, 23, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+static FILTER_INFO axsae_filters[] = {
+	{{0}, {0}, PPA_IPPROTO_TCP, 0, 443, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
+	{{0}, {0}, PPA_IPPROTO_TCP, 0, 23, (PPA_SESSION_FILTER_PROTO | PPA_SESSION_FILTER_DPORT)},
 };
-struct list_head *g_session_filter_list[MAX_HAL+1];
+
+struct mutex g_session_filter_lock;
+struct list_head *g_session_filter_list[MAX_HAL + 1];
 
 /*
  * ####################################
@@ -224,15 +230,15 @@ int32_t ppa_get_fid(PPA_IFNAME *ifname, uint16_t *fid)
 FILTER_INFO* get_matched_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 {
 	FILTER_INFO *filter_node;
-	struct list_head *list_tmp = NULL;
 
-	if (g_session_filter_list[hal_id] == NULL){
+	rcu_read_lock();
+	if (!g_session_filter_list[hal_id]) {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "HAL[%d] not initialized\n", hal_id);
+		rcu_read_unlock();
 		return NULL;
 	}
 
-	list_for_each(list_tmp, g_session_filter_list[hal_id]){
-		filter_node = list_entry(list_tmp, FILTER_INFO, list);
-
+	list_for_each_entry_rcu(filter_node, g_session_filter_list[hal_id], list) {
 		if (!((filter_node->flags & PPA_SESSION_FILTER_PROTO) && (filter_node->ip_proto != entry->ip_proto))
 			&& !((filter_node->flags & PPA_SESSION_FILTER_SPORT) && (filter_node->src_port != entry->src_port))
 			&& !((filter_node->flags & PPA_SESSION_FILTER_DPORT) && (filter_node->dst_port != entry->dst_port))
@@ -241,9 +247,11 @@ FILTER_INFO* get_matched_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 				|| (filter_node->flags & PPA_SESSION_FILTER_SPORT))) {
 
 			filter_node->hit_cnt++;
+			rcu_read_unlock();
 			return filter_node;
 		}
 	}
+	rcu_read_unlock();
 
 	return NULL;
 }
@@ -252,17 +260,19 @@ bool add_filter_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 {
 	FILTER_INFO *filter_node;
 
+	mutex_lock(&g_session_filter_lock);
 	filter_node = get_matched_entry(hal_id, entry);
-
 	if (filter_node) {
-		printk("Filter already exists with these params\n");
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "Filter exists\n");
+		mutex_unlock(&g_session_filter_lock);
 		return true;
 	}
 
-	if (g_session_filter_list[hal_id] == NULL) {
+	if (!g_session_filter_list[hal_id]) {
 		g_session_filter_list[hal_id] = (struct list_head *)ppa_malloc(sizeof(struct list_head));
 		if (g_session_filter_list[hal_id] == NULL) {
-			printk("Memory allocation failed\n");
+			pr_err("[%s:%d] malloc failed!\n",__func__,__LINE__);
+			mutex_unlock(&g_session_filter_lock);
 			return false;
 		}
 		INIT_LIST_HEAD(g_session_filter_list[hal_id]);
@@ -271,11 +281,14 @@ bool add_filter_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 	filter_node = (FILTER_INFO *)ppa_malloc(sizeof(FILTER_INFO));
 	if (filter_node == NULL) {
 		/* Dont free g_session_filter_list head on return */
-		printk("Memory allocation failed\n");
+		pr_err("[%s:%d] malloc failed!\n",__func__,__LINE__);
+		mutex_unlock(&g_session_filter_lock);
 		return false;
 	}
+
 	memset(filter_node, 0, sizeof(FILTER_INFO));
-	list_add_tail( &(filter_node->list), g_session_filter_list[hal_id]);
+	list_add_tail_rcu(&filter_node->list, g_session_filter_list[hal_id]);
+	mutex_unlock(&g_session_filter_lock);
 
 	filter_node->ip_proto = entry->ip_proto;
 	filter_node->src_port = entry->src_port;
@@ -285,55 +298,63 @@ bool add_filter_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 	return true;
 }
 
+static void free_session_filter_rcu(struct rcu_head *rcu)
+{
+	FILTER_INFO *filter_node;
+	int i;
+
+	filter_node = container_of(rcu, FILTER_INFO, rcu);
+	ppa_free(filter_node);
+
+	for (i=0; i<=MAX_HAL; i++) {
+		/* Free the head */
+		if(g_session_filter_list[i]) {
+			if (list_empty(g_session_filter_list[i])) {
+				ppa_free(g_session_filter_list[i]);
+				g_session_filter_list[i] = NULL;
+			}
+		}
+	}
+}
+
 bool del_filter_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 {
 	FILTER_INFO *filter_node;
 
+	mutex_lock(&g_session_filter_lock);
 	filter_node = get_matched_entry(hal_id, entry);
-
-	if (!filter_node){
-		printk("Entry not found in the list\n");
+	if (!filter_node) {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "entry not found\n");
+		mutex_unlock(&g_session_filter_lock);
 		return false;
 	}
 
-	list_del_init(&filter_node->list);
-	ppa_free(filter_node);
-
-	/* Free the head if list becomes empty*/
-	if(g_session_filter_list[hal_id] != NULL) {
-		if (list_empty(g_session_filter_list[hal_id])) {
-			ppa_free(g_session_filter_list[hal_id]);
-			g_session_filter_list[hal_id] = NULL;
-		}
-	}
+	list_del_rcu(&filter_node->list);
+	call_rcu(&entry->rcu, free_session_filter_rcu);
+	mutex_unlock(&g_session_filter_lock);
 
 	return true;
 }
 
 bool del_filter_list (PPA_HAL_ID hal_id)
 {
-	FILTER_INFO *filter_node;
-	struct list_head *list_tmp = NULL;
-	struct list_head *list_node = NULL;
+	FILTER_INFO *filter_node, *list_tmp;
 
-	if (g_session_filter_list[hal_id] == NULL){
-		printk("No Entries in filter list for HAL: %d\n",hal_id);
+	mutex_lock(&g_session_filter_lock);
+	if (!g_session_filter_list[hal_id]) {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "HAL[%d] not initialized\n", hal_id);
+		mutex_unlock(&g_session_filter_lock);
 		return true;
 	}
 
-	list_for_each_safe(list_node, list_tmp, g_session_filter_list[hal_id]){
-		filter_node = list_entry(list_node, FILTER_INFO, list);
-		list_del(list_node);
-		ppa_free(filter_node);
+	list_for_each_entry_safe(filter_node, list_tmp, g_session_filter_list[hal_id], list) {
+		list_del_rcu(&filter_node->list);
+		call_rcu(&filter_node->rcu, free_session_filter_rcu);
 	}
+	mutex_unlock(&g_session_filter_lock);
 
-	/* Free the head */
-	if(g_session_filter_list[hal_id] != NULL) {
-		if (list_empty(g_session_filter_list[hal_id])) {
-			ppa_free(g_session_filter_list[hal_id]);
-			g_session_filter_list[hal_id] = NULL;
-		}
-	}
+	// ensure all RCU callbacks complete before exit.
+	rcu_barrier();
 
 	return true;
 }
@@ -677,6 +698,7 @@ int32_t ppa_init(PPA_INIT_INFO *p_info, uint32_t flags)
 	else
 		printk("ppa_init - init failed (%d)\n", ret);
 
+	mutex_init(&g_session_filter_lock);
 	/* Add default Session filters */
 	for (i=0; i<(sizeof(axglobal_filters)/sizeof(FILTER_INFO)); i++) {
 		add_filter_entry (MAX_HAL, &axglobal_filters[i]);

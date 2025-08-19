@@ -72,6 +72,7 @@ struct nf_node {
 
 struct	lp_info * pp_hal_db_get_lp_rxinfo(int32_t sess_id);
 bool	is_pp_sess_valid(int32_t sess_id);
+uint16_t get_cpu_qid(int);
 
 /*
  * ####################################
