@@ -37,6 +37,8 @@
 #include <linux/byteorder/generic.h>
 #include <linux/netfilter/nf_conntrack_common.h>
 #include <linux/workqueue.h>
+#include <net/inet_hashtables.h>
+#include <net/tcp.h>
 
 #if IS_ENABLED(CONFIG_PPA_EXT_PKT_LEARNING)
 #include <linux/pktprs.h>
@@ -4967,9 +4969,102 @@ static int32_t ppa_accel_disabled(PPA_BUF *ppa_buf)
 	return accel_st;
 }
 
+static bool tcp_sk_established(struct pktprs_desc *desc, int dir)
+{
+	struct sock *sk;
+	struct net *net;
+	uint16_t srcport = 0, dstport = 0;
+	union nf_inet_addr src_ip, dst_ip;
+	struct net_device *dev;
+
+	dev = desc->skb->dev;
+	if (unlikely(!dev)) {
+		pr_debug("no device attached to skb!!\n");
+		return 0;
+	}
+
+	net = dev_net(dev);
+	if (unlikely(!net)) {
+		pr_debug("no namespace associated with %s !!\n", dev->name);
+		return 0;
+	}
+
+	pktprs_src_ip(&src_ip, desc->rx);
+	pktprs_dst_ip(&dst_ip, desc->rx);
+	srcport = pktprs_src_port(desc->rx);
+	dstport = pktprs_dst_port(desc->rx);
+
+	if (dir == SESSION_FLAG2_CPU_OUT) {
+		sk = __inet_lookup_established(net, &tcp_hashinfo,
+				dst_ip.ip, htons(dstport),
+				src_ip.ip, srcport,
+				desc->skb->skb_iif, inet_sdif(desc->skb));
+	} else {
+		sk = __inet_lookup_established(net, &tcp_hashinfo,
+				src_ip.ip, htons(srcport),
+				dst_ip.ip, dstport,
+				desc->skb->skb_iif, inet_sdif(desc->skb));
+	}
+
+	if (!sk || (sk->sk_state == TCP_NEW_SYN_RECV || sk->sk_state == TCP_SYN_RECV)) {
+		pr_debug("sk(%p) state %d dev:(%s) src:ip %pI4 port %u dst: ip %pI4 port %u "
+				 "skb_iif %d slave_iif %d\n",
+				 sk, sk ? sk->sk_state : 0,
+				 dev->name, &src_ip.ip, srcport, &dst_ip.ip, dstport,
+				 desc->skb->skb_iif, inet_sdif(desc->skb));
+		if (sk)
+			sock_put(sk);
+
+		return false;
+	}
+
+	pr_debug("sk(%p) state (%d) dev:(%s) src:ip %pI4 port %u dst: ip %pI4 port %u "
+			"skb_iif %d slave_iif %d\n",
+			sk, sk->sk_state, dev->name, &src_ip.ip, srcport, &dst_ip.ip, dstport,
+			desc->skb->skb_iif, inet_sdif(desc->skb));
+	sock_put(sk);
+
+	return true;
+}
+
+static bool _dos_filter(struct pktprs_desc *desc, PPA_SESSION *session,
+			uint16_t l3_proto, uint16_t l4_proto)
+{
+	bool ret = false;
+
+	if (!session && l3_proto != ETH_P_IPV6 && l4_proto == PPA_IPPROTO_TCP) {
+		if (!pktprs_netif(desc->rx)) { /* CPU-out TCP traffic */
+			if (!tcp_sk_established(desc, SESSION_FLAG2_CPU_OUT))
+				ret = true;
+		} else if (!pktprs_netif(desc->tx)) { /* CPU-in TCP traffic */
+			if (!tcp_sk_established(desc, SESSION_FLAG2_CPU_IN))
+				ret = true;
+		}
+	}
+	return ret;
+}
+/**
+ * @brief Check if certain datapath combinations are not supported.
+ * @param p_item
+ * @return bool true if it is, false otherwise
+ */
+static bool ppa_is_unsupported_dp(struct uc_session_node *p_item,
+				  struct pktprs_desc *desc, PPA_SESSION *session,
+				  uint16_t l3_proto, uint16_t l4_proto)
+{
+	bool ret = false;
+
+	if (p_item) {
+		ret = (p_item->flag2 & SESSION_FLAG2_CPU_BOUND) && (p_item->flag2 & SESSION_FLAG2_XLAT);
+	} else {
+		ret = _dos_filter(desc, session, l3_proto, l4_proto);
+	}
+	return ret;
+}
+
 static int32_t ppa_packet_filter(PPA_BUF *ppa_buf, PPA_SESSION *session,
 	uint16_t l3_proto, uint16_t l4_proto, uint16_t sport, uint16_t dport,
-	uint32_t flags, uint16_t last_ethtype)
+	uint32_t flags, uint16_t last_ethtype, struct pktprs_desc *desc)
 {
 	int32_t ret = PPA_SESSION_NOT_FILTED;
 	uint8_t pp_accl_mode = PP_ACCL_MODE_NORMAL;
@@ -5034,6 +5129,9 @@ static int32_t ppa_packet_filter(PPA_BUF *ppa_buf, PPA_SESSION *session,
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"can not accelerate: %px\n", session);
 		ret = PPA_SESSION_FILTED;
 	}
+
+	if (ppa_is_unsupported_dp(NULL, desc, session, l3_proto, l4_proto))
+		ret = PPA_SESSION_FILTED;
 
 	return ret;
 }
@@ -5167,19 +5265,6 @@ static inline bool ppa_is_xlat_sess(struct pktprs_desc *desc)
 			PKTPRS_HDR_LEVEL0))) &&
 			!PKTPRS_IS_MULTI_IP(desc->rx) &&
 			!PKTPRS_IS_MULTI_IP(desc->tx));
-}
-
-/**
- * @brief Check if certain datapath combinations are not supported.
- * @param p_item
- * @return bool true if it is, false otherwise
- */
-static inline bool ppa_is_unsupported_dp(struct uc_session_node *p_item)
-{
-	bool val;
-
-	val = (p_item->flag2 & SESSION_FLAG2_CPU_BOUND) && (p_item->flag2 & SESSION_FLAG2_XLAT);
-	return val;
 }
 
 int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
@@ -5333,7 +5418,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	}
 
 	if (ppa_packet_filter(ppa_buf, ct, l3_proto, l4_proto, srcport,
-			dstport, flags, last_ethtype) == PPA_SESSION_FILTED)
+			dstport, flags, last_ethtype, desc) == PPA_SESSION_FILTED)
 		return PPA_FAILURE;
 
 	/*For ESP sessions we dont look the connection track */
@@ -5429,7 +5514,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 			p_item->flag2 |= SESSION_FLAG2_CPU_IN;
 		}
 
-		if (ppa_is_unsupported_dp(p_item)) {
+		if (ppa_is_unsupported_dp(p_item, NULL, NULL, 0, 0)) {
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d Unsupported dp case\n",
 					__FUNCTION__, __LINE__);
 			return PPA_FAILURE;

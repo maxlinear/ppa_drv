@@ -4770,6 +4770,11 @@ static void check_aqm_lld_for_docsis(PPA_SUBIF *dp_port,
 		dbg("failed to get sf for queue %u\n", rt_entry->dst_q);
 		return;
 	}
+	/* case the q is not part of any service flow */
+	if (sf_indx >= PP_QOS_MAX_SERVICE_FLOWS) {
+		dbg("sf_indx %u is out of range\n", sf_indx);
+		return;
+	}
 
 	ret = pp_misc_sf_conf_get(sf_indx, &sf_cfg);
 	if (ret) {
@@ -4779,8 +4784,14 @@ static void check_aqm_lld_for_docsis(PPA_SUBIF *dp_port,
 
 	if (sf_cfg.llsf)
 		set_bit(PP_SESS_FLAG_LLD_BIT, &rt_entry->flags);
-	else if (sf_cfg.aqm_mode == PP_QOS_AQM_MODE_NORMAL)
+	else if ((sf_cfg.aqm_mode == PP_QOS_AQM_MODE_NORMAL) || (sf_cfg.aqm_mode == PP_QOS_AQM_MODE_NO_DROP)) {
+		/*  we need to open AQM session even in PP_QOS_AQM_MODE_NO_DROP state: though AQM shouldn't drop in this
+			state, we still expect the buffer control to drop packets.
+			another reason that traffic should pass through AQM path in this state: the histogram update that
+			expected to be done.
+		*/
 		set_bit(PP_SESS_FLAG_AQM_BIT, &rt_entry->flags);
+	}
 }
 
 /*!
