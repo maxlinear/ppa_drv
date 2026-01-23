@@ -7,7 +7,7 @@
 ** DATE		: 4 NOV 2008
 ** AUTHOR	: Xu Liang
 ** DESCRIPTION  : PPA Protocol Stack Hook API Session Operation Functions
-** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
+** COPYRIGHT	: Copyright (c) 2020-2026 MaxLinear, Inc.
 ** 	              Copyright(c) 2009, Lantiq Deutschland GmbH
 **	              Am Campeon 3; 85579 Neubiberg, Germany
 **
@@ -5055,7 +5055,16 @@ static bool ppa_is_unsupported_dp(struct uc_session_node *p_item,
 	bool ret = false;
 
 	if (p_item) {
-		ret = (p_item->flag2 & SESSION_FLAG2_CPU_BOUND) && (p_item->flag2 & SESSION_FLAG2_XLAT);
+		if ((p_item->flag2 & SESSION_FLAG2_CPU_BOUND) &&
+			(p_item->flag2 & SESSION_FLAG2_XLAT)) {
+			ret = true;
+		} else if ((p_item->flag2 & SESSION_FLAG2_CPU_OUT) &&
+			    (desc->tx && get_correct_hdr_lvl(desc->tx) != PKTPRS_HDR_LEVEL0)) {
+			ret = true;
+		} else if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
+			    (desc->rx && get_correct_hdr_lvl(desc->rx) != PKTPRS_HDR_LEVEL0)) {
+			ret = true;
+		}
 	} else {
 		ret = _dos_filter(desc, session, l3_proto, l4_proto);
 	}
@@ -5514,7 +5523,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 			p_item->flag2 |= SESSION_FLAG2_CPU_IN;
 		}
 
-		if (ppa_is_unsupported_dp(p_item, NULL, NULL, 0, 0)) {
+		if (ppa_is_unsupported_dp(p_item, desc, NULL, 0, 0)) {
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d Unsupported dp case\n",
 					__FUNCTION__, __LINE__);
 			return PPA_FAILURE;
@@ -5580,7 +5589,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 		__ppa_session_put(p_item);
 		ppa_session_bucket_unlock(idx);
 __ADD_SESSION_DONE:
-		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d session created skb=%px hash=%x\n", __FUNCTION__,__LINE__, ppa_buf, p_item->hash);
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d session created skb=%px hash=%x\n", __FUNCTION__,__LINE__, ppa_buf, p_item ? p_item->hash : 0);
 	} else {
 	/* session exists update the required parameters */
 		idx = ppa_session_get_index(p_item->hash);
@@ -5983,7 +5992,16 @@ __UPDATE_SESSION_SKIP_MAC:
 					}
 					p_item->flag2 &= ~SESSION_FLAG2_ADD_HW_FAIL;
 					p_item->flags &= ~SESSION_NOT_ACCEL_FOR_MGM;
-					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d HW session add success\n", __FUNCTION__, __LINE__);
+
+					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+							"%s %d %s\n",
+         						 __FUNCTION__,
+         						 __LINE__,
+							 (p_item->flags & SESSION_ADDED_IN_HW) ?
+							 "Session offloaded to HW" :
+							 (p_item->flags & SESSION_ADDED_IN_SW) ?
+							 "Session offloaded to SW fast path" :
+							 "Session not offloaded");
 				}
 			}
 __UPDATE_SESSION_DONE:

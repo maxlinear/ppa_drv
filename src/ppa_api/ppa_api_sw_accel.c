@@ -800,6 +800,9 @@ SKIP_PPPOE_TUNNEL_CHECK:
 		return PPA_FAILURE;
 	}
 
+	if (p_item->session)
+		test_and_set_bit(IPS_OFFLOAD_BIT, &p_item->session->status);
+
 	/* check for ttl default value change*/
 	ip_ttl_default = ppa_get_ip_ttl_default();
 	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d added swacc session add succeeded\n", __FUNCTION__, __LINE__);
@@ -839,6 +842,10 @@ void swac_del_routing_entry(PPA_ROUTING_INFO *route)
 	if( (p_item->flags & SESSION_ADDED_IN_SW) ) {
 		p_item->flags &= ~SESSION_ADDED_IN_SW;
 	}
+
+	if (p_item->session)
+		clear_bit(IPS_OFFLOAD_BIT, &p_item->session->status);
+
 	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d deleted swacc session\n", __FUNCTION__, __LINE__);
 	if (IsIpv6Session(p_item->flags))
 		PPA_HAL_RTSTATS_DEC(curr_uc_ipv6_session);
@@ -954,8 +961,8 @@ static int flag_header_ipv4( struct flag_header *pFlagHdr, const unsigned char* 
 }
 
 static int flag_header_ipv6( struct flag_header *pFlagHdr, 
-								const unsigned char* data,
-								unsigned char data_offset )
+				const unsigned char* data,
+				unsigned char data_offset )
 {
 	int isValid=1;
 	struct ipv6hdr *ip6h = (struct ipv6hdr*)(data);

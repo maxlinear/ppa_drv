@@ -5,7 +5,7 @@
  * MODULES	: PPA framework support for QoS events and helper functions
  *
  * DESCRIPTION	: PPA API support for QoS events and helper functions.
- * COPYRIGHT	: Copyright (C) 2022-2024 MaxLinear, Inc.
+ * COPYRIGHT	: Copyright (C) 2022-2026 MaxLinear, Inc.
  *
  * For licensing information, see the file 'LICENSE' in the root folder
  * of this software module.
@@ -798,28 +798,18 @@ static bool ppa_qos_is_configured(netdev_qos_priv *devqospriv)
 static void ppa_qos_update_high_prio_q(uint32_t prio, netdev_qos_priv *devqospriv,
 		struct netdev_attr *attr)
 {
-	int32_t i, start, end, step;
+	int32_t idx;
 
 	/*
 	 * The usr_def_q will be stored at lower priority in the qid_map.
-	 * During the search for the next high-priority queue, if usr_def_q is
-	 * stored at lower index, traverse in the forward direction. Otherwise,
-	 * traverse in the reverse direction.
+	 * Traverse in the reverse direction to find the next high-priority queue.
+	 * For unclassified traffic, use the prio of usr-def-q to get the dst_q_high
 	 */
-	if (devqospriv->qid_map[1] == devqospriv->usr_def_q) {
-		start = prio + 1;
-		end = PRIO_MAX_Q + 1;
-		step = 1;
-	} else {
-		start = prio - 1;
-		end = 0;
-		step = -1;
-	}
-
-	for (i = start; i != end; i += step) {
-		if (devqospriv->qid_map[i] != -1) {
-			MODULE_DBG("High prio queue(%d) found\n", devqospriv->qid_map[i]);
-			attr->dst_q_high = ppa_dpm_to_pp_qos(devqospriv->qid_map[i]);
+	idx = prio ? (prio - 1) : (devqospriv->usr_def_q_prio - 1);
+	for (; idx > 0; idx--) {
+		if (devqospriv->qid_map[idx] != -1) {
+			MODULE_DBG("High prio queue(%d) found\n", devqospriv->qid_map[idx]);
+			attr->dst_q_high = ppa_dpm_to_pp_qos(devqospriv->qid_map[idx]);
 			return;
 		}
 	}
@@ -835,10 +825,9 @@ static void ppa_qos_update_high_prio_q(uint32_t prio, netdev_qos_priv *devqospri
 static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 	struct netdev_attr *attr)
 {
-	int32_t i, dp_q = -1;
+	int32_t dp_q = -1;
 	int32_t pp_q = 0;
 	uint32_t prio = 0U;
-	uint32_t prio_bkp = 0U;
 	PPA_NETIF *txif = NULL;
 	PPA_IFNAME phys_netif_name[PPA_IF_NAME_SIZE];
 	netdev_qos_priv *devqospriv = NULL;
@@ -873,35 +862,32 @@ static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 		netifdev->name, txif->name, attr->mark);
 
 	if (devqospriv->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
-		prio_bkp = attr->tc + 1;
-	} else {
+		prio = attr->tc + 1;
+	} else if (attr->mark) {
 #ifdef HAVE_QOS_EXTMARK
 		GET_DATA_FROM_MARK_OPT(attr->mark, QUEPRIO_MASK, QUEPRIO_START_BIT_POS,
-				prio_bkp);
+				prio);
 #else
 		GET_DATA_FROM_MARK_OPT(attr->mark, MARK_QUEPRIO_MASK,
-				MARK_QUEPRIO_START_BIT_POS, prio_bkp);
+				MARK_QUEPRIO_START_BIT_POS, prio);
 #endif
+	} else {
+		/* mark/extmark NOT set but skb->priority is set
+		 * Reverse Linux priority mapping to align with HW QoS:
+		 * Linux:  0(lowest) -> 7(highest)
+		 * HW QoS: 8(lowest) -> 1(highest)
+		 * Priority >= 7: set to highest priority (1)
+		 */
+		prio = (attr->tc < 7) ? (8 - attr->tc) : 1;
 	}
 
-	prio = prio_bkp;
-	/* For unclassified traffic, use the prio of usr-def-q to get dst_q_high */
-	if (!prio && devqospriv->usr_def_q > 0) {
-		for (i = 1; i < PORT_MAX_Q; i++) {
-			if (devqospriv->qid_map[i] == devqospriv->usr_def_q) {
-				prio = i;
-				break;
-			}
-		}
-	}
-	if (prio) {
-		ppa_qos_update_high_prio_q(prio, devqospriv, attr);
-		dp_q = devqospriv->qid_map[prio_bkp];
-	}
+	/* Get the dst_q_high for TDOX ACK prioritization */
+	ppa_qos_update_high_prio_q(prio, devqospriv, attr);
 
-	if (dp_q == -1)
-		dp_q = (devqospriv->usr_def_q > 0) ? devqospriv->usr_def_q :
-				devqospriv->def_q;
+	/* Get the destination queue for data traffic */
+	dp_q = devqospriv->qid_map[prio];
+	dp_q = (dp_q >= 0) ? dp_q : ((devqospriv->usr_def_q > 0) ?
+		devqospriv->usr_def_q : devqospriv->def_q);
 
 	pp_q = ppa_dpm_to_pp_qos(dp_q);
 	if (pp_q == PP_QOS_INVALID_ID) {
@@ -910,7 +896,7 @@ static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 		pp_q = ppa_dpm_to_pp_qos(dp_q);
 	}
 	MODULE_DBG("devqospriv dev %s prio %u dp_q %d pp_q %d\n",
-			devqospriv->netif->name, prio_bkp, dp_q, pp_q);
+			devqospriv->netif->name, prio, dp_q, pp_q);
 	rcu_read_unlock();
 	return pp_q;
 }

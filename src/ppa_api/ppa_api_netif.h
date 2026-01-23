@@ -10,7 +10,7 @@
  ** AUTHOR	: Xu Liang
  ** DESCRIPTION	: PPA Protocol Stack Hook API Network Interface Functions
  **					Header File
- ** COPYRIGHT	: Copyright © 2020-2024 MaxLinear, Inc.
+ ** COPYRIGHT	: Copyright © 2020-2026 MaxLinear, Inc.
  **               Copyright (c) 2017 Intel Corporation
  **               Copyright (c) 2010 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
  **
@@ -101,6 +101,7 @@ b) Veth interface (host side veth interface under bridge) gets NETDEV_DOWN event
 #define NETIF_VANI_INTERFACE 0x00000002
 #define NETIF_VAP_QOS       0x00000004
 #define NETIF_LAN_WAN       0x00000008
+#define PPA_QOS_MAX_CHILD_QDISC 8
 
 /* ####################################
  *		Data Type
@@ -154,6 +155,8 @@ struct netif_info {
 	bool			enable;
 	bool			is_tc_configured;
 	uint8_t			tc_qdisc_cnt;
+	/* Track qdisc handles to avoid double-counting */
+	uint32_t		tc_qdisc_handles[PPA_QOS_MAX_CHILD_QDISC];
 	PPA_ATOMIC		count;
 	PPA_IFNAME		name[PPA_IF_NAME_SIZE];
 	/*only for simple network interface, like macvlan, wlan multiple SSIS,

@@ -5,7 +5,7 @@
  * MODULES	: PPA framework support for qos-tc.
  *
  * DESCRIPTION	: QoS-TC adaptation for Logical interfaces support.
- * COPYRIGHT	: Copyright (C) 2023-2025 MaxLinear Inc.
+ * COPYRIGHT	: Copyright (C) 2023-2026 MaxLinear Inc.
  *
  * For licensing information, see the file 'LICENSE' in the root folder
  * of this software module.
@@ -592,12 +592,36 @@ TC_QOS_DONE:
 	return ret;
 }
 
+static u32 ppa_qos_get_qdisc_handle(enum tc_setup_type type, void *type_data)
+{
+	u32 handle = 0;
+
+	switch (type) {
+	case TC_SETUP_QDISC_PRIO:
+		handle = ((struct tc_prio_qopt_offload *)type_data)->handle;
+		break;
+	case TC_SETUP_QDISC_DRR:
+		handle = ((struct tc_drr_qopt_offload *)type_data)->handle;
+		break;
+	case TC_SETUP_QDISC_TBF:
+		handle = ((struct tc_tbf_qopt_offload *)type_data)->handle;
+		break;
+	default:
+		/* For other qdisc types, handle might not be available */
+		break;
+	}
+
+	return handle;
+}
+
 int32_t ppa_qos_tc_setup(struct net_device *dev, enum tc_setup_type type,
 		void *type_data)
 {
 	struct qos_tc_params tc_params = {0};
 	struct netif_info *p_ifinfo = NULL;
-	int32_t ret = PPA_FAILURE;
+	int32_t i, ret = PPA_FAILURE;
+	u32 handle = 0;
+	bool handle_found = false;
 
 	if (ppa_get_netif_info(dev->name, &p_ifinfo) != PPA_SUCCESS || !p_ifinfo) {
 		ppa_debug(DBG_ENABLE_MASK_ERR, "%s: Failed to get p_ifinfo for %s\n",
@@ -611,6 +635,19 @@ int32_t ppa_qos_tc_setup(struct net_device *dev, enum tc_setup_type type,
 	}
 
 	if (ppa_qos_is_sched_add_config(type, type_data)) {
+		/* Extract handle from type_data based on setup type */
+		handle = ppa_qos_get_qdisc_handle(type, type_data);
+
+		/* Check if this handle was already counted */
+		if (handle != 0) {
+			for (i = 0; i < PPA_QOS_MAX_CHILD_QDISC; i++) {
+				if (p_ifinfo->tc_qdisc_handles[i] == handle) {
+					handle_found = true;
+					break;
+				}
+			}
+		}
+
 		ret = ppa_qos_update_base_sch_info(type, type_data, dev->name);
 		if (ret != PPA_SUCCESS)
 			goto TC_QOS_DONE;
@@ -621,7 +658,21 @@ int32_t ppa_qos_tc_setup(struct net_device *dev, enum tc_setup_type type,
 					" %s\n", dev->name);
 			goto TC_QOS_DONE;
 		}
-		p_ifinfo->tc_qdisc_cnt++;
+
+		/* Only increment counter if handle is new */
+		if (!handle_found) {
+			/* Find an empty slot and store the handle */
+			if (handle != 0 && p_ifinfo->tc_qdisc_cnt <
+					PPA_QOS_MAX_CHILD_QDISC) {
+				for (i = 0; i < PPA_QOS_MAX_CHILD_QDISC; i++) {
+					if (p_ifinfo->tc_qdisc_handles[i] == 0) {
+						p_ifinfo->tc_qdisc_handles[i] = handle;
+						break;
+					}
+				}
+			}
+			p_ifinfo->tc_qdisc_cnt++;
+		}
 		p_ifinfo->is_tc_configured = true;
 	}
 
@@ -638,6 +689,20 @@ int32_t ppa_qos_tc_setup(struct net_device *dev, enum tc_setup_type type,
 
 
 	if (ppa_qos_is_sched_del_config(type, type_data)) {
+		/* Extract handle for deletion */
+		handle = ppa_qos_get_qdisc_handle(type, type_data);
+
+		/* Remove handle from tracking array */
+		if (handle != 0) {
+			for (i = 0; i < PPA_QOS_MAX_CHILD_QDISC; i++) {
+				if (p_ifinfo->tc_qdisc_handles[i] == handle) {
+					/* Mark slot as empty */
+					p_ifinfo->tc_qdisc_handles[i] = 0;
+					break;
+				}
+			}
+		}
+
 		if (p_ifinfo->tc_qdisc_cnt == 1) {
 			ret = ppa_qos_sched_del(dev->name);
 			if (ret != PPA_SUCCESS) {

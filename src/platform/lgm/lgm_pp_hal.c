@@ -5348,6 +5348,10 @@ non_lro_ppv4_session:
 		PPA_HAL_RTSTATS_INC(curr_uc_ipv6_session);
 	route->entry = p_item->routing_entry = session_id;
 	p_item->flags |= SESSION_ADDED_IN_HW;
+
+	if (p_item->session)
+		test_and_set_bit(IPS_HW_OFFLOAD_BIT, &p_item->session->status);
+
 	p_item->dest_qid = rt_entry.dst_q;
 
 	/*set used flag in hal db*/
@@ -5504,6 +5508,9 @@ int32_t del_routing_entry(PPA_ROUTING_INFO *route)
 
 	}
 	p_item->flags &= ~SESSION_ADDED_IN_HW;
+
+	if (p_item->session)
+		clear_bit(IPS_HW_OFFLOAD_BIT, &p_item->session->status);
 
 #if IS_ENABLED(CONFIG_INTEL_VPN) || IS_ENABLED(CONFIG_MXL_VPN)
 	if (!list_empty(&p_item->tun_node)) {

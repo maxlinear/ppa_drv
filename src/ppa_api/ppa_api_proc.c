@@ -2039,16 +2039,7 @@ int ppa_uc_session_display_all(void)
 
 static int ppa_uc_session_delete_all(void)
 {
-	struct uc_session_node *pp_item = NULL;
-	uint32_t pos = 0;
-
-	if (ppa_session_start_iteration(&pos, &pp_item) == PPA_SUCCESS) {
-		do {
-			__ppa_session_put(pp_item);
-			__ppa_session_delete_item(pp_item);
-		} while (ppa_session_iterate_next(&pos, &pp_item) == PPA_SUCCESS);
-	}
-	ppa_session_stop_iteration();
+	ppa_session_list_free();   /* safe, lock-aware bulk delete */
 	return 0;
 }
 
