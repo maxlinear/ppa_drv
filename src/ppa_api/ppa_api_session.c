@@ -6042,6 +6042,15 @@ static int add_outbound_tunnel_session(struct pktprs_desc *desc)
 	if (PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL0) &&
 	    !PKTPRS_IS_ESP(desc->rx, PKTPRS_HDR_LEVEL0) &&
 	    !(PKTPRS_IS_MULTI_IP(desc->rx) && PKTPRS_IS_ESP(desc->rx, PKTPRS_HDR_LEVEL1))) {
+		struct xfrm_offload *xo;
+
+		xo = xfrm_offload(desc->skb);
+		if (!xo) {
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s %d no offload found\n",
+				  __func__, __LINE__);
+			return -1;
+		}
+
 		vpn_ops = dp_get_vpn_ops(0);
 		if (!vpn_ops) {
 			ppa_debug(DBG_ENABLE_MASK_ERR, "vpn_ops is null\n");

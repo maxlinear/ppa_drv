@@ -7,7 +7,7 @@
 ** DATE		: 29 Oct 2018
 ** AUTHOR	: Kamal Eradath
 ** DESCRIPTION	: PPv4 hardware abstraction layer
-** COPYRIGHT	: Copyright (c) 2020-2025 MaxLinear, Inc.
+** COPYRIGHT	: Copyright (c) 2020-2026 MaxLinear, Inc.
 **                Copyright (c) 2014, Intel Corporation.
 **
 **	 For licensing information, see the file 'LICENSE' in the root folder of
@@ -5074,6 +5074,13 @@ non_lro_ppv4_session:
 				}
 				rt_entry.dst_q = q_logic.q_logic_id;
 				rt_entry.dst_q_high = -1;
+				if (!sk_gro_support) {
+					dbg("Non LRO PPV4 Sesion\n");
+					if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags)) {
+						clear_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
+						dbg("clearing SLRO info flag\n");
+					}
+				}
 			}
 #endif /*CONFIG_LGM_TOE*/
 
