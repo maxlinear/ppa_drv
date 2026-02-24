@@ -79,6 +79,7 @@
 #if IS_ENABLED(CONFIG_PPA_MPE_IP97)
 #include <crypto/ltq_ipsec_ins.h>
 #endif
+#include <net/xfrm.h>
 /*
  * ####################################
  *			  Definition
@@ -5027,12 +5028,56 @@ static bool tcp_sk_established(struct pktprs_desc *desc, int dir)
 	return true;
 }
 
+static bool _unsupported_nat(struct pktprs_desc *desc, int16_t l3_proto, uint16_t l4_proto)
+{
+	bool ret = false;
+
+	/* Early exits for invalid descriptors */
+	if (!desc || !desc->rx || !desc->tx)
+		return false;
+	
+	if(PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL0) ||
+	   PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL1)) 
+		return false;
+
+	if ((l3_proto == ETH_P_IP) && (l4_proto == PPA_IPPROTO_TCP || l4_proto == PPA_IPPROTO_UDP)) {
+		__be32 rx_ip, tx_ip;
+		__be16 rx_port = 0, nat_port = 0; 
+		PPA_NATIP srcip = { }, natip = { };
+
+		if (!pktprs_netif(desc->rx)) { /* CPU-out TCP traffic */
+			pktprs_src_ip((union nf_inet_addr *)&srcip.natsrcip.ip.ip, desc->rx);
+			pktprs_src_ip((union nf_inet_addr *)&natip.natsrcip.ip.ip, desc->tx);
+			rx_port  = pktprs_src_port(desc->rx);
+			nat_port = pktprs_src_port(desc->tx);
+		} else if (!pktprs_netif(desc->tx)) { /* CPU-in TCP traffic */
+			pktprs_dst_ip((union nf_inet_addr *)&srcip.natsrcip.ip.ip, desc->rx);
+			pktprs_dst_ip((union nf_inet_addr *)&natip.natsrcip.ip.ip, desc->tx);
+			rx_port  = pktprs_dst_port(desc->rx);
+			nat_port = pktprs_dst_port(desc->tx);
+		}	
+		rx_ip = srcip.natsrcip.ip.ip;
+		tx_ip = natip.natsrcip.ip.ip;
+
+		if ((rx_ip != tx_ip) || (rx_port != nat_port)) {
+			pr_debug("%s %d NAT: src(rx)=%pI4 -> src(tx)=%pI4 nat_port %d nat_port %d\n",
+				__FUNCTION__, __LINE__,  &rx_ip, &tx_ip, rx_port, nat_port);
+			ret = true;
+		}
+	}
+	return ret;
+}
+
 static bool _dos_filter(struct pktprs_desc *desc, PPA_SESSION *session,
 			uint16_t l3_proto, uint16_t l4_proto)
 {
 	bool ret = false;
 
-	if (!session && l3_proto != ETH_P_IPV6 && l4_proto == PPA_IPPROTO_TCP) {
+	/* Early exits for invalid descriptors */
+	if (!desc || !desc->rx || !desc->tx)
+		return false;
+
+	if (!session && (l3_proto == ETH_P_IP && l4_proto == PPA_IPPROTO_TCP)) {
 		if (!pktprs_netif(desc->rx)) { /* CPU-out TCP traffic */
 			if (!tcp_sk_established(desc, SESSION_FLAG2_CPU_OUT))
 				ret = true;
@@ -5043,32 +5088,85 @@ static bool _dos_filter(struct pktprs_desc *desc, PPA_SESSION *session,
 	}
 	return ret;
 }
+
 /**
  * @brief Check if certain datapath combinations are not supported.
- * @param p_item
- * @return bool true if it is, false otherwise
+ * @return true if unsupported, false otherwise.
  */
 static bool ppa_is_unsupported_dp(struct uc_session_node *p_item,
-				  struct pktprs_desc *desc, PPA_SESSION *session,
-				  uint16_t l3_proto, uint16_t l4_proto)
+		struct pktprs_desc *desc, PPA_SESSION *session,
+		uint16_t l3_proto, uint16_t l4_proto)
 {
-	bool ret = false;
+	bool cpu_bound, xlat, cpu_out, cpu_in;
+	struct pktprs_desc *d = desc;
+	struct sec_path *sp = NULL;
 
-	if (p_item) {
-		if ((p_item->flag2 & SESSION_FLAG2_CPU_BOUND) &&
-			(p_item->flag2 & SESSION_FLAG2_XLAT)) {
-			ret = true;
-		} else if ((p_item->flag2 & SESSION_FLAG2_CPU_OUT) &&
-			    (desc->tx && get_correct_hdr_lvl(desc->tx) != PKTPRS_HDR_LEVEL0)) {
-			ret = true;
-		} else if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
-			    (desc->rx && get_correct_hdr_lvl(desc->rx) != PKTPRS_HDR_LEVEL0)) {
-			ret = true;
-		}
-	} else {
-		ret = _dos_filter(desc, session, l3_proto, l4_proto);
+	if (!d) {
+		pr_debug("(%s:%d) invalid desc!!\n", __func__,__LINE__);
+		return true;;
 	}
-	return ret;
+
+	if (!p_item) {
+		bool ret = _dos_filter(desc, session, l3_proto, l4_proto);
+		/* if not DOS filter */	
+		if (ret == 0) {
+			return _unsupported_nat(desc, l3_proto, l4_proto);
+		}
+		return ret;
+	}
+
+	cpu_bound = p_item->flag2 & SESSION_FLAG2_CPU_BOUND;
+	xlat      = p_item->flag2 & SESSION_FLAG2_XLAT;
+	cpu_out   = p_item->flag2 & SESSION_FLAG2_CPU_OUT;
+	cpu_in    = p_item->flag2 & SESSION_FLAG2_CPU_IN;
+	sp = skb_sec_path(d->skb);
+
+	/* CPU_BOUND + XLAT together are unsupported */
+	if (cpu_bound && xlat) {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"(%s:%d) cpubound xlat not supported\n",
+			  __FUNCTION__, __LINE__);
+		return true;
+	} else if (cpu_bound && sp) {
+		struct xfrm_state *xs = NULL;
+
+		xs = xfrm_input_state(d->skb);
+		if (xs && !xs->xso.offload_handle) {
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"(%s:%d) invalid offload_hndl %lu\n",
+				  __FUNCTION__, __LINE__, xs ? xs->xso.offload_handle: 0);
+			return true;
+		}
+	}
+
+	if (cpu_out) {
+		if (d->tx) {
+			if (get_correct_hdr_lvl(d->tx) != PKTPRS_HDR_LEVEL0) {
+				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+					  "(%s:%d) cpu_out: multilevel not supported\n",
+					  __FUNCTION__, __LINE__);
+				return true;
+			}
+		}
+	} else if (cpu_in) {
+		if (d->rx) {
+			if (sp) {
+				if (!PKTPRS_IS_ESP(d->rx, PKTPRS_HDR_LEVEL0)) {
+					/* already accelerated */
+					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+						  "(%s:%d) cpu_in: xfrm already accelerated!!\n",
+						  __FUNCTION__, __LINE__);
+					return true;
+				}
+			}
+			if (get_correct_hdr_lvl(d->rx) != PKTPRS_HDR_LEVEL0) {
+				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+					  "(%s:%d) cpu_in: multilevel not supported\n",
+					  __FUNCTION__, __LINE__);
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 static int32_t ppa_packet_filter(PPA_BUF *ppa_buf, PPA_SESSION *session,
@@ -5386,7 +5484,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	}
 
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
-	/*For locally generated traffic; if lpdev doesnot exist return*/
+	/* For locally generated traffic; if lpdev doesnot exist return */
 	if (!(desc->rx->ifindex) && (is_lpdev(NULL) == PPA_FAILURE))
 		return PPA_FAILURE;
 #endif /* CONFIG_X86_INTEL_LGM || CONFIG_SOC_LGM */
@@ -5458,7 +5556,6 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	if (PPA_SESSION_EXISTS != ret) {
 	/* session is not found; we need to add a new session */
 
-
 		/* allocate the us_session_node */
 		p_item = ppa_session_alloc_item();
 		if (!p_item) {
@@ -5493,8 +5590,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	  		p_item->flags |= SESSION_IS_TCP;
 		}
 
-		/*For locally generated traffic; if lpdev enabled */
-		if (!(desc->rx->ifindex)) {
+		if (!(desc->rx->ifindex) && !((PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL0) || PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL1)))) {
 			pktprs_src_ip((union nf_inet_addr *)&p_item->pkt.src_ip, desc->tx);
 			pktprs_dst_ip((union nf_inet_addr *)&p_item->pkt.dst_ip, desc->tx);
 		} else {
@@ -5510,7 +5606,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 		if (ppa_is_xlat_sess(desc))
 			p_item->flag2 |= SESSION_FLAG2_XLAT;
 
-		if (!p_item->rx_if
+		if ((!p_item->rx_if || !p_item->ig_gpid)
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
 			|| (is_lpdev(p_item->rx_if) == true)
 #endif /* IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM) */
@@ -5523,11 +5619,6 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 			p_item->flag2 |= SESSION_FLAG2_CPU_IN;
 		}
 
-		if (ppa_is_unsupported_dp(p_item, desc, NULL, 0, 0)) {
-			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d Unsupported dp case\n",
-					__FUNCTION__, __LINE__);
-			return PPA_FAILURE;
-		}
 #if IS_ENABLED(CONFIG_PPA_ACCEL)
 		p_item->timeout = ppa_get_default_session_timeout();
 #endif
@@ -5647,6 +5738,13 @@ __ADD_SESSION_DONE:
 	  				SET_DBG_FLAG(p_item, SESSION_DBG_NOT_REACH_MIN_HITS);
 			} else {
 update_session:
+				if (ppa_is_unsupported_dp(p_item, desc, NULL, 0, 0)) {
+					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d Unsupported dp case\n",
+							__FUNCTION__, __LINE__);
+					p_item->flags |= SESSION_NOT_ACCELABLE;
+					goto __UPDATE_SESSION_DONE;
+				}
+
 				/* TBD - print RX and TX headers for debug using pktprs API */
 				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d update session\n", __FUNCTION__, __LINE__);
 
@@ -5881,7 +5979,7 @@ update_session:
 				/*Get the nat information */
 				ppa_memset(&p_item->pkt.natip, 0, sizeof(p_item->pkt.natip));
 				p_item->pkt.nat_port= 0;
-				if (p_item->flags & SESSION_LAN_ENTRY) {
+				if (p_item->flags & SESSION_LAN_ENTRY || p_item->flag2 & SESSION_FLAG2_CPU_OUT) {
 					/* If upstream session and egress packet is ESP */
 					if(PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL0) ||
 						PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL1)) {

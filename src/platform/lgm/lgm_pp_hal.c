@@ -4843,6 +4843,13 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 
 	ppa_memset(&rt_entry, 0, sizeof(struct pp_sess_create_args));
 
+	if ((p_item->flag2 & SESSION_FLAG2_CPU_OUT) &&
+	    (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND)) {
+		if (desc->rx && (desc->rx->ifindex != g_vpna_conn.dev->ifindex)) {
+			dbg("Invalid outbound session!!!\n");
+			return PPA_FAILURE;
+		}
+	} 
 	nsess_add++;
 
 	rt_entry.in_port = p_item->ig_gpid;
@@ -4854,11 +4861,17 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 		/* Local out session */
 		/*TBD: ingress port needs to be set as the litepath device gpid when the litepath HW acceleration is enabled*/
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
-			if (lpdev_validate_socket(p_item, desc)) {
-				p_item->flags |= SESSION_NOT_ACCELABLE;
-				return PPA_FAILURE;
+			if (p_item->flags & SESSION_TUNNEL_ESP) {
+				rt_entry.in_port = g_vpna_conn.gpid;
+				dbg("esp: rt_entry.in_port %d\n", rt_entry.in_port);
+			} else { 
+				if (lpdev_validate_socket(p_item, desc)) {
+					p_item->flags |= SESSION_NOT_ACCELABLE;
+					return PPA_FAILURE;
+				}
+				rt_entry.in_port = ppa_get_lp_gpid();
+				dbg("lpdev: rt_entry.in_port %d\n", rt_entry.in_port);
 			}
-			rt_entry.in_port = ppa_get_lp_gpid();
 #else
 			/*until the hw acceleration is enabled; we keep this session not accelable*/
 			p_item->flags |= SESSION_NOT_ACCELABLE;
@@ -4874,6 +4887,14 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 		return PPA_ENOMEM;
 	}
 	ppa_memset(dp_port, 0, sizeof(PPA_SUBIF));
+
+	/* NO tx_if: CPU-in pkt and IPsec inbound case: */
+	if (!p_item->tx_if &&
+	   (p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
+	   (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
+		p_item->tx_if = g_vpna_conn.dev;
+		dbg("CPU-in esp packet \n");
+	}
 
 	if (p_item->tx_if) {
 	/* get the physical tx netdevice*/
@@ -4953,7 +4974,8 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 		}
 	} else {
 		/* Locally terminated session we need to get the CPU GPID/queueid or LRO GPID/queueid*/
-		if ((p_item->flag2 & SESSION_FLAG2_CPU_IN)) {
+		if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
+		    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
 #if IS_ENABLED(CONFIG_LGM_TOE)
 			if (!ppa_bypass_lro(desc->skb)) {
 				/*add lro entry in PP and lro engine */
@@ -5132,7 +5154,8 @@ non_lro_ppv4_session:
 		if (!is_eg_vpna) {
 			rt_entry.ps = 0;
 
-			if ((p_item->flag2 & SESSION_FLAG2_CPU_IN)) {
+			if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
+			    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
 				if (is_hw_litepath_enabled()) {
 					/* If litepath is enabled packet needs to be received
@@ -5216,7 +5239,8 @@ non_lro_ppv4_session:
 	}
 
 	if (is_hw_litepath_enabled() &&
-		(p_item->flag2 & SESSION_FLAG2_CPU_OUT)) {
+		(p_item->flag2 & SESSION_FLAG2_CPU_OUT) &&
+		!(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND)) {
 		ppa_memcpy(desc->rx, desc->tx, sizeof(struct pktprs_hdr));
 		if (p_item->flags & SESSION_VALID_VLAN_INS)
 			pktprs_proto_remove(desc->rx, PKTPRS_PROTO_VLAN0, PKTPRS_HDR_LEVEL0);
@@ -5231,8 +5255,11 @@ non_lro_ppv4_session:
 		set_bit(PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT, &rt_entry.flags);
 		rt_entry.color = PP_COLOR_GREEN;
 	}
-	if ((p_item->flag2 & SESSION_FLAG2_CPU_IN))
+
+	if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
+	    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
 		ppa_memcpy(desc->tx, desc->rx, sizeof(struct pktprs_hdr));
+	}
 
 	/* Fill in the fv information */
 	rt_entry.rx = desc->rx;
@@ -5376,7 +5403,8 @@ non_lro_ppv4_session:
 			if (pp_hal_db[session_id].lp_rxinfo) {
 				ppa_memset(pp_hal_db[session_id].lp_rxinfo,
 					   0, sizeof(struct lp_info));
-				if (p_item->flag2 & SESSION_FLAG2_CPU_IN) {
+				if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
+				    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
 					struct sock *sk = desc->skb->sk;
 					enum pktprs_proto proto_type = PKTPRS_PROTO_IPV4;
 #if IS_ENABLED(CONFIG_IPV6)
@@ -5411,7 +5439,8 @@ non_lro_ppv4_session:
 						p_item->pkt.ip_proto;
 					pp_hal_db[session_id].lp_rxinfo->lro_sessid =
 						p_item->lro_sessid;
-				} else if (p_item->flag2 & SESSION_FLAG2_CPU_OUT) {
+				} else if ((p_item->flag2 & SESSION_FLAG2_CPU_OUT) &&
+					   !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND)) {
 					struct sock *sk = lpdev_sk_lookup(p_item, desc->skb->skb_iif);
 
 					if (sk) {
@@ -5469,7 +5498,8 @@ int32_t del_routing_entry(PPA_ROUTING_INFO *route)
 		    __LINE__, p_item, p_item->routing_entry);
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
 		if (is_hw_litepath_enabled() &&
-		    (p_item->flag2 & SESSION_FLAG2_CPU_OUT)) {
+		    (p_item->flag2 & SESSION_FLAG2_CPU_OUT) &&
+		    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND)) {
 			struct sock *sk;
 
 			spin_lock_bh(&g_hal_db_lock);
