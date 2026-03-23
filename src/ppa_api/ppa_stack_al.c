@@ -1451,6 +1451,39 @@ bool ppa_tdox_enable_get(void)
 }
 EXPORT_SYMBOL(ppa_tdox_enable_get);
 
+bool ppa_is_netif_wifi(PPA_NETIF *net_if)
+{
+	PPA_SUBIF *subif = NULL;
+	bool is_wifi = false;
+
+	if (!net_if) {
+		pr_err("[%s:%d] netif error\n", __func__, __LINE__);
+		return false;
+	}
+
+	subif = ppa_malloc(sizeof(PPA_SUBIF));
+	if (!subif) {
+		pr_err("(%s:%d) ppa_malloc failed for dev %s",
+			  __func__,__LINE__,net_if->name);
+                goto __out_free;
+	}
+	ppa_memset(subif, 0, sizeof(PPA_SUBIF));
+
+        if (dp_get_netif_subifid(net_if, NULL, NULL, NULL, subif, 0)) {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"(%s:%d) subifid failed for dev %s",
+			  __func__,__LINE__,net_if->name);
+                goto __out_free;
+        }
+
+	is_wifi = subif->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT);
+
+__out_free:
+	if (subif)
+		ppa_free(subif);
+	return is_wifi;
+}
+EXPORT_SYMBOL(ppa_is_netif_wifi);
+
 int32_t ppa_bypass_lro(PPA_BUF *ppa_buf)
 {
 #if IS_ENABLED(CONFIG_LGM_TOE)
@@ -1475,6 +1508,12 @@ int32_t ppa_bypass_lro(PPA_BUF *ppa_buf)
 #endif
 		if ((ppa_buf->len < 100) && !len_diff)
 			return 1;
+
+		if (ppa_is_netif_wifi(ppa_buf->dev)) {
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"(%s:%d) lro skip for dev %s",
+				  __func__,__LINE__, ppa_buf->dev ? ppa_buf->dev->name : NULL);
+			return 1;
+		}
 	}
 #else /* !CONFIG_LGM_TOE */
 	PPA_SESSION *p_session = NULL;

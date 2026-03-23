@@ -39,6 +39,8 @@
 #include <linux/workqueue.h>
 #include <net/inet_hashtables.h>
 #include <net/tcp.h>
+#include <net/netfilter/nf_conntrack_timeout.h>
+#include <net/netfilter/nf_conntrack_l4proto.h>
 
 #if IS_ENABLED(CONFIG_PPA_EXT_PKT_LEARNING)
 #include <linux/pktprs.h>
@@ -2523,6 +2525,52 @@ extern PPA_HLIST_HEAD	g_session_list_hash_table[SESSION_LIST_HASH_TABLE_SIZE];
 extern void ppa_nf_ct_refresh_acct(PPA_SESSION *ct, PPA_CTINFO ctinfo,
 		unsigned long extra_jiffies, unsigned long bytes, unsigned int pkts);
 
+#if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+/*
+ * Dynamically looks up the configured timeout from CT policy (per-flow or global)
+ * and refreshes the conntrack entry. It also caches the timeout value in
+ * p_item->ct_timeout for easier debug prints in sysfs etc.
+ */
+static void ppa_update_ct_timeout(struct uc_session_node *p_item,
+				  PPA_CTINFO ctinfo,
+				  unsigned long bytes,
+				  unsigned int packets)
+{
+	struct nf_conn *ct;
+	const unsigned int *timeouts;
+	struct net *net;
+	uint8_t tcp_state = TCP_CONNTRACK_ESTABLISHED;
+
+	if (!p_item->session)
+		return;
+
+	ct = p_item->session;
+	net = nf_ct_net(ct);
+
+	/* Get timeout policy - per-flow or global */
+	timeouts = nf_ct_timeout_lookup(ct);
+
+	if (p_item->flags & SESSION_IS_TCP) {
+		/* TCP: use timeout for current state */
+		tcp_state = READ_ONCE(ct->proto.tcp.state);
+
+		if (!timeouts)
+			timeouts = nf_tcp_pernet(net)->timeouts;
+
+		p_item->ct_timeout = timeouts[tcp_state];
+	} else if (p_item->pkt.ip_proto == PPA_IPPROTO_UDP) {
+		/* UDP: use timeout based on reply state */
+		if (!timeouts)
+			timeouts = nf_udp_pernet(net)->timeouts;
+		if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status))
+			p_item->ct_timeout = timeouts[UDP_CT_REPLIED];
+		else
+			p_item->ct_timeout = timeouts[UDP_CT_UNREPLIED];
+	} /* else: use the cached timeout captured just before the offload */
+
+	ppa_nf_ct_refresh_acct(ct, ctinfo, p_item->ct_timeout, bytes, packets);
+}
+#endif /* CONFIG_X86_INTEL_LGM || CONFIG_SOC_LGM */
 
 static void ppa_chk_hit_stat(struct work_struct *w);
 /* Declare work queue handler thread */
@@ -2597,8 +2645,7 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
 							DEFAULT_HIT_MULTIPLIER*g_hit_polling_time*HZ, tmp, route.packets);
 #else
 					curr_time_jif = ((u32)(jiffies));
-					ppa_nf_ct_refresh_acct(p_item->session, ctinfo,
-							p_item->ct_timeout, tmp, route.packets);
+					ppa_update_ct_timeout(p_item, ctinfo, tmp, route.packets);
 					p_item->last_hit_time_jif = curr_time_jif;
 #endif
 
@@ -6081,6 +6128,7 @@ __UPDATE_SESSION_SKIP_MAC:
 					ret = PPA_FAILURE;
 					goto __UPDATE_SESSION_DONE;
 				} else {
+					/* Cache the ct timeout regardless of the l4 proto */
 					if (ct) {
 						p_item->ct_timeout =
 							READ_ONCE(ct->timeout) - nfct_time_stamp;

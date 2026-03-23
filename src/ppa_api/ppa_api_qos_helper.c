@@ -48,6 +48,7 @@
 #define PORT_MAX_Q  (SZ_8 * SZ_8)
 #define DEBUGFS_LEN 40
 #define PRIO_MAX_Q 8
+#define TC_MINOR_MASK 0xFFFF
 
 /*! module name */
 #define PPA_QOS_EVENT_MODULE "qos_helper"
@@ -861,25 +862,22 @@ static int32_t ppa_qos_get_mapped_queue(PPA_NETIF __rcu *netif,
 	MODULE_DBG("netif %s txif %s mark %u\n",
 		netifdev->name, txif->name, attr->mark);
 
-	if (devqospriv->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
-		prio = attr->tc + 1;
-	} else if (attr->mark) {
 #ifdef HAVE_QOS_EXTMARK
-		GET_DATA_FROM_MARK_OPT(attr->mark, QUEPRIO_MASK, QUEPRIO_START_BIT_POS,
-				prio);
+	GET_DATA_FROM_MARK_OPT(attr->mark, QUEPRIO_MASK, QUEPRIO_START_BIT_POS,
+			prio);
 #else
-		GET_DATA_FROM_MARK_OPT(attr->mark, MARK_QUEPRIO_MASK,
-				MARK_QUEPRIO_START_BIT_POS, prio);
+	GET_DATA_FROM_MARK_OPT(attr->mark, MARK_QUEPRIO_MASK,
+			MARK_QUEPRIO_START_BIT_POS, prio);
 #endif
-	} else {
-		/* mark/extmark NOT set but skb->priority is set
-		 * Reverse Linux priority mapping to align with HW QoS:
-		 * Linux:  0(lowest) -> 7(highest)
-		 * HW QoS: 8(lowest) -> 1(highest)
-		 * Priority >= 7: set to highest priority (1)
-		 */
-		prio = (attr->tc < 7) ? (8 - attr->tc) : 1;
-	}
+	/*
+	 * Priority selection logic:
+	 * - If mark priority < PRIO_MAX_Q (8): Extract from skb->priority (TC minor handle)
+	 * - If mark priority >= PRIO_MAX_Q: Use the extracted mark priority value
+	 * Valid priority range: 0(lowest) -> 7(highest).
+	 * TODO: Queue selection should be based on both major and minor handles
+	 *       once hierarchical QoS support is implemented.
+	 */
+	prio = (prio < PRIO_MAX_Q) ? (attr->tc & TC_MINOR_MASK) : prio;
 
 	/* Get the dst_q_high for TDOX ACK prioritization */
 	ppa_qos_update_high_prio_q(prio, devqospriv, attr);

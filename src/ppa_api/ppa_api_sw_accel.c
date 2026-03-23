@@ -584,6 +584,11 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 		}
 	} else {
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d\n", __FUNCTION__, __LINE__);
+		if (p_item->flag2 & SESSION_FLAG2_FRAG) {
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "(%s:%d) No SWA fragmented pkts\n",
+				  __FUNCTION__, __LINE__);
+			return PPA_FAILURE;
+		}
 		/* IPV4/IPV6 session */
 		swaHdr.network_offset = swaHdr.transport_offset = tlen;
 		if( isIPv6 ) {

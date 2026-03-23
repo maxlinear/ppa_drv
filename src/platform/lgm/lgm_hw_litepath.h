@@ -77,6 +77,8 @@ static inline void lp_rxinfo_put(struct lp_info *lp_rxinfo)
 	if (refcount_dec_and_test(&lp_rxinfo->refcnt)) {
 		if (lp_rxinfo->dst)
 			dst_release(lp_rxinfo->dst);
+		if (lp_rxinfo->netif)
+			ppa_put_netif(lp_rxinfo->netif);
 		ppa_free(lp_rxinfo);
 	}
 }

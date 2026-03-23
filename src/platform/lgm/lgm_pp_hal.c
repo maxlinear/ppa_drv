@@ -99,6 +99,38 @@
 #define SESSION_RETRY_MAX	 8
 #define ETH_MTU	1500
 #define PPA_MAX_DSCP 64
+#define CPU_QUEUE_LEN_USER 128 /* user created CPU queue len */
+#define MAX_CPU_COUNT		4
+
+int cpu_new_qid_map[2 * MAX_CPU_COUNT] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+
+/* The following CPU port information is fixed across the platform and values
+ * will remain unchanged after reboot.
+ * - cqm_deq_ports of CPU high/low ports: 0, 1, 2, 3, 4, 5, 6, 7 (from cpu0 to cpu3)
+ * - Corresponding GPIDs: 16, 17, 18, 19, 20, 21, 22, 23
+ * - Physical Queue IDs: 1, 2, 3, 4, 5, 6, 7, 8
+ */
+static const struct cpu_port_info {
+	int port;	/* High/Low CPU port number */
+	int gpid;	/* GPID of high/low CPU port */
+	int qid_dflt;	/* Queue ID for the high/low CPU port */
+} cpu_ports_info[2 * MAX_CPU_COUNT] = {
+	{ 0, 16, 1 },
+	{ 1, 17, 2 },
+	{ 2, 18, 3 },
+	{ 3, 19, 4 },
+	{ 4, 20, 5 },
+	{ 5, 21, 6 },
+	{ 6, 22, 7 },
+	{ 7, 23, 8 },
+};
+
+/* Identify which queue-id mapping to use. */
+enum qid_path {
+    QIDPATH_NORMAL = 0,    /* use cpu_qmap[] */
+    QIDPATH_WIFI_RX,    /* use cpu_new_qid_map[] */
+};
+
 /*
  *	Compilation Switch
  */
@@ -345,6 +377,7 @@ struct BBF247_Session_Info {
 #if IS_ENABLED(CONFIG_LGM_TOE)
 extern int32_t ppa_bypass_lro(PPA_BUF *ppa_buf);
 #endif /*IS_ENABLED(CONFIG_LGM_TOE)*/
+extern bool ppa_is_netif_wifi(PPA_NETIF *net_if);
 
 #if !IS_ENABLED(CONFIG_SGAM)
 enum pp_sgc_lvl {
@@ -902,8 +935,11 @@ static inline uint16_t get_cpu_portinfo(void)
 	return 16;
 }
 
-inline uint16_t get_cpu_qid(int cpu)
+inline uint16_t get_cpu_qid(int cpu, enum qid_path path)
 {
+	if (path == QIDPATH_WIFI_RX)
+		return cpu_new_qid_map[cpu];
+
 	if (cpu < nr_cpu_ids)
 		return cpu_qmap[cpu];
 	return 0;
@@ -1535,7 +1571,7 @@ static inline int32_t init_tdox_nf(void)
 	nf_info.subif = ppa_get_lp_subif();
 
 	/* cpu qid for lro */
-	q_logic.q_id = get_cpu_qid(smp_processor_id());
+	q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
 
 	/* physical to logical qid */
 	if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
@@ -3217,7 +3253,6 @@ static ssize_t proc_set_ppv4_debug(struct file *file, const char __user *buf, si
 	} else {
 		printk(KERN_ERR "usage : echo <enable/disable> > /sys/kernel/debug/ppa/pp_hal/dbg\n");
 	}
-
 	return len;
 }
 
@@ -4635,7 +4670,7 @@ int32_t add_supportive_hw_route_entry(PPA_ROUTING_INFO *route)
 	for (i = 0; i < ARRAY_SIZE(rt_entry.tbm); i++)
 		rt_entry.tbm[i] = PP_TBM_INVALID;
 
-	q_logic.q_id = get_cpu_qid(smp_processor_id());
+	q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
 
 	if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
 		pr_err("%s:%d ERROR Failed to Logical Queue Id\n",
@@ -5067,7 +5102,7 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 					dbg("lro entry add failed\n");
 					rt_entry.eg_port = get_cpu_portinfo();
 					rt_entry.tmp_ud_sz = COPY_16BYTES;
-					q_logic.q_id = get_cpu_qid(smp_processor_id());
+					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
 
 					if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
 						pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
@@ -5085,18 +5120,39 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 				}
 			} else {
 non_lro_ppv4_session:
-				rt_entry.eg_port = get_cpu_portinfo();
-				rt_entry.tmp_ud_sz = COPY_16BYTES;
-				q_logic.q_id = get_cpu_qid(smp_processor_id());
-				dbg("[%s] q_logic.q_id = %d q_logic.q_logic_id = %d\n",__func__, q_logic.q_id, q_logic.q_logic_id);
-				if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
-					pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
+				bool wifi_rx_dev = false;
+				PPA_NETIF *netif = ppa_dev_get_by_index(desc->rx->ifindex);
+
+				if (!netif) {
+					dbg("Invalid netif \n");
 					ppa_free(dp_port);
 					return PPA_FAILURE;
 				}
+
+				rt_entry.eg_port = get_cpu_portinfo();
+				rt_entry.tmp_ud_sz = COPY_16BYTES;
+
+				wifi_rx_dev = ppa_is_netif_wifi(netif);
+				if (wifi_rx_dev)
+					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_WIFI_RX);
+				else
+					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
+
+
+				if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
+					pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
+					ppa_free(dp_port);
+					ppa_put_netif(netif);
+					return PPA_FAILURE;
+				}
+				dbg("q_logic: q_id = %d q_logic_id = %d is_wifi_rx_dev = %d dev %s\n",
+					q_logic.q_id, q_logic.q_logic_id, wifi_rx_dev,
+				        desc->skb->dev ? netdev_name(netif) : "NULL");
+				ppa_put_netif(netif);
 				rt_entry.dst_q = q_logic.q_logic_id;
 				rt_entry.dst_q_high = -1;
-				if (!sk_gro_support) {
+				/* no soft lro session if sk doesn't support or rx-dev is wifi */
+				if (!sk_gro_support || wifi_rx_dev) {
 					dbg("Non LRO PPV4 Sesion\n");
 					if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags)) {
 						clear_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
@@ -5110,12 +5166,8 @@ non_lro_ppv4_session:
 			/*Set the gpid and qid of lpdev device*/
 			if (is_hw_litepath_enabled()) {
 				rt_entry.eg_port = ppa_get_lp_gpid();
-				if (!(p_item->flag2 & SESSION_FLAG2_LRO)) {
-					rt_entry.dst_q = ppa_get_lp_qid();
-					rt_entry.dst_q_high = -1;
-				}
 				if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags)) {
-					q_logic.q_id = get_cpu_qid(smp_processor_id());
+					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
 					if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
 						pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
 						ppa_free(dp_port);
@@ -5223,7 +5275,6 @@ non_lro_ppv4_session:
 			/*Set the session flags */
 			set_bit(PP_SESS_FLAG_PS_VALID_BIT, &rt_entry.flags);
 		}
-
 	} else {
 		/*TBD: Fill in the pp_port_cls_data in case we have a second cycle through PPv4 */
 	}
@@ -5418,11 +5469,15 @@ non_lro_ppv4_session:
 						dst_clone(skb_dst(desc->skb));
 					if (sk && sk->sk_bound_dev_if) {
 						pp_hal_db[session_id].lp_rxinfo->netif =
-							dev_get_by_index_rcu(sock_net(sk),
-									     sk->sk_bound_dev_if);
+							dev_get_by_index(sock_net(sk),
+										sk->sk_bound_dev_if);
 					} else {
-						pp_hal_db[session_id].lp_rxinfo->netif =
-							ppa_get_lp_dev();
+						PPA_NETIF *netif = ppa_dev_get_by_index(desc->rx->ifindex);
+						pp_hal_db[session_id].lp_rxinfo->netif = netif;
+					}
+					if (!pp_hal_db[session_id].lp_rxinfo->netif) {
+						pr_err("%s netif:null for ifindex:%d\n", __func__,
+						       desc->rx->ifindex);
 					}
 					pp_hal_db[session_id].lp_rxinfo->l3_offset =
 						pktprs_hdr_off(desc->tx, proto_type,
@@ -5453,13 +5508,15 @@ non_lro_ppv4_session:
 				}
 				refcount_set(&pp_hal_db[session_id].lp_rxinfo->refcnt, 1);
 
-				pp_hal_db[session_id].stats = 
+				pp_hal_db[session_id].stats =
 					(struct pp_stats *)ppa_malloc(sizeof(struct pp_stats));
 				if (pp_hal_db[session_id].stats) {
 					ppa_memset(pp_hal_db[session_id].stats,
 						   0, sizeof(struct pp_stats));
 				} else {
 					pr_err("[%s:%d] stats alloc failure!\n", __func__, __LINE__);
+					lp_rxinfo_put(pp_hal_db[session_id].lp_rxinfo);
+					pp_hal_db[session_id].lp_rxinfo = NULL;
 					spin_unlock_bh(&g_hal_db_lock);
 					return PPA_FAILURE;
 				}
@@ -6592,6 +6649,104 @@ bool is_pp_sess_valid(int32_t sess_id)
 }
 EXPORT_SYMBOL(is_pp_sess_valid);
 
+/**
+ * Create low-priority queues for each CPU port
+ */
+static int dp_wifi_cpu_ing_queues_create(void)
+{
+	int ret;
+	int i, pos;
+	struct dp_node_alloc anode = {0};
+	struct dp_node_link node = {0};
+
+	for (i = 0; i < MAX_CPU_COUNT; i++) {
+		if (!cpu_online(i))
+			continue;
+
+		for (pos = i * 2; pos < (i + 1) * 2; pos++) {
+			struct dp_queue_conf qcfg = {0};
+
+			anode.inst = 0;
+			anode.dp_port = 0;
+			anode.type = DP_NODE_QUEUE;
+			anode.id.q_id = DP_NODE_AUTO_ID;
+
+			ret = dp_node_alloc(&anode, 0);
+			if (ret == DP_FAILURE) {
+				pr_err("queue alloc failed for cqm_deq_port %d\n",
+				       cpu_ports_info[pos].port);
+				ret = -ENOMEM;
+				return PPA_FAILURE;
+			}
+			cpu_new_qid_map[pos] = anode.id.q_id;
+
+			node.arbi = ARBITRATION_WSP;
+			node.prio_wfq = 7;
+			node.node_type = DP_NODE_QUEUE;
+			node.node_id.q_id = anode.id.q_id;
+			node.p_node_type = DP_NODE_PORT;
+			node.cqm_deq_port.cqm_deq_port = cpu_ports_info[pos].port;
+			node.p_node_id.cqm_deq_port = cpu_ports_info[pos].port;
+
+			ret = dp_node_link_add(&node, 0);
+			if (ret == DP_FAILURE) {
+				pr_err("queue %d failed to link cqm_deq_port %d\n",
+				       cpu_new_qid_map[pos], cpu_ports_info[pos].port);
+				dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
+				ret = -ENODEV;
+				return PPA_FAILURE;
+			}
+
+			qcfg.q_id = cpu_new_qid_map[pos];
+			qcfg.wred_max_allowed = CPU_QUEUE_LEN_USER;
+
+			ret = dp_queue_conf_set(&qcfg, 0);
+			if (ret != DP_SUCCESS)
+				pr_err("qlen update failed for qid %d\n", qcfg.q_id);
+		}
+	}
+	return PPA_SUCCESS;
+}
+
+/**
+ * Remove low-priority queues from each CPU port
+ */
+static void dp_wifi_cpu_ing_queues_delete(void)
+{
+	int ret;
+	int i, pos;
+	struct dp_node_link node = {0};
+	struct dp_node_alloc anode = {0};
+
+	for (i = 0; i < MAX_CPU_COUNT; i++) {
+		if (!cpu_online(i))
+			continue;
+
+		for (pos = i * 2; pos < (i + 1) * 2; pos++) {
+			if (cpu_new_qid_map[pos] == -1)
+				continue;
+
+			node.node_type = DP_NODE_QUEUE;
+			node.node_id.q_id = cpu_new_qid_map[pos];
+
+			ret = dp_node_unlink(&node, 0);
+			if (ret == DP_FAILURE)
+				pr_err("queue %d unlink failed\n", cpu_new_qid_map[pos]);
+
+			anode.type = DP_NODE_QUEUE;
+			anode.id.q_id = cpu_new_qid_map[pos];
+
+			ret = dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
+			if (ret == DP_FAILURE)
+				pr_err("queue %d free failed\n", cpu_new_qid_map[pos]);
+
+			printk("qid %d deleted from cqm_deq_port %d (cpu %d)\n",
+				 cpu_new_qid_map[pos], cpu_ports_info[pos].port, i);
+			cpu_new_qid_map[pos] = -1;
+		}
+	}
+}
+
 /*
  * ####################################
  *		 Init/Cleanup API
@@ -6666,6 +6821,7 @@ static inline void hal_init(void)
 
 static inline void hal_exit(void)
 {
+	dp_wifi_cpu_ing_queues_delete();
 	pphal_fbm_exit();
 	uninit_frag_nf();
 	uninit_mc_nf();
@@ -6694,6 +6850,7 @@ static int __init lgm_pp_hal_init(void)
 #if defined(PPA_API_PROC)
 	ppv4_proc_file_create();
 #endif
+	dp_wifi_cpu_ing_queues_create();
 	printk(KERN_INFO"lgm_pp_hal loaded successfully MAX_HW_SESSIONS=%d\n", g_max_hw_sessions);
 	return 0;
 }
