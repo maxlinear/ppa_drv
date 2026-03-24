@@ -5261,11 +5261,12 @@ non_lro_ppv4_session:
 					}
 					if (dp_port->alloc_flag & (DP_F_FAST_WLAN |
 								   DP_F_FAST_WLAN_EXT)) {
-						/*In case of DC interfaces we dont need Egress flag */
+						/* In case of DC interfaces we dont need Egress flag */
 						/* This field carries DevQos for wireless*/
-						/*set the DevQoS bit 24:27 */
+						rt_entry.ps &= ~GENMASK(31, 24);
+						/* set the DevQoS bit 24:27 */
 						rt_entry.ps |= (p_item->pkt.priority & 0xF) << 24;
-						/*set the Calss bit 28:31 */
+						/* set the Class bit 28:31 */
 						rt_entry.ps |= (p_item->pkt.priority & 0xF) << 28;
 						dbg("rt_entry.ps:0x%x qosprio:%d\n", rt_entry.ps, p_item->pkt.priority);
 					}
