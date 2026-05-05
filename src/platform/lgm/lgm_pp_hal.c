@@ -50,9 +50,12 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/if_ether.h>
+#include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/if_pppox.h>
 #include <linux/net.h>
+#include <linux/mutex.h>
+#include <net/net_namespace.h>
 #include <net/tcp.h>
 #include <net/udp.h>
 #include <net/route.h>
@@ -128,7 +131,7 @@ static const struct cpu_port_info {
 /* Identify which queue-id mapping to use. */
 enum qid_path {
     QIDPATH_NORMAL = 0,    /* use cpu_qmap[] */
-    QIDPATH_WIFI_RX,    /* use cpu_new_qid_map[] */
+    QIDPATH_WIFI_RX,       /*  use cpu_new_qid_map[] */
 };
 
 /*
@@ -247,6 +250,11 @@ enum qid_path {
 #if defined(PPA_API_PROC)
 static int proc_read_ppv4_tdox_enable(struct inode *inode, struct file *file);
 static ssize_t proc_set_ppv4_tdox_enable(struct file *file, const char __user *buf, size_t count, loff_t *data);
+static int dbg_read_ppv4_static_sess(struct seq_file *seq, void *v);
+static int dbg_read_ppv4_static_sess_seq_open(struct inode *inode,
+		struct file *file);
+static ssize_t dbg_set_ppv4_static_sess(struct file *file,
+		const char __user *buf, size_t count, loff_t *data);
 
 static int proc_read_ppv4_ifstats_seq_open(struct inode *, struct file *);
 
@@ -267,6 +275,10 @@ static int proc_read_ppv4_vpn_tunn_open(struct inode *, struct file *);
 
 static int proc_read_ppv4_debug_seq_open(struct inode *, struct file *);
 static ssize_t proc_set_ppv4_debug(struct file *, const char __user *, size_t , loff_t *);
+static inline int32_t set_egress_port_n_queue(struct uc_session_node *p_item,
+					      struct pp_sess_create_args *rt_entry,
+					      struct pktprs_desc *desc,
+					      PPA_SUBIF *dp_port);
 
 #if IS_ENABLED(CONFIG_PPA_BBF247_MODE1)
 static int ppa_run_cmd(const char *cmd);
@@ -610,6 +622,15 @@ static const struct file_operations dbgfs_file_ppv4_tdox_enable_fops = {
 	.read		= seq_read,
 	.write		= proc_set_ppv4_tdox_enable,
 	.llseek	 	= seq_lseek,
+	.release	= single_release,
+};
+
+static const struct file_operations dbgfs_file_ppv4_static_sess_fops = {
+	.owner		= THIS_MODULE,
+	.open		= dbg_read_ppv4_static_sess_seq_open,
+	.read		= seq_read,
+	.write		= dbg_set_ppv4_static_sess,
+	.llseek		= seq_lseek,
 	.release	= single_release,
 };
 
@@ -1918,12 +1939,34 @@ static inline int32_t ppa_vpn_parse_rx(struct sk_buff *skb,
 	uint16_t totlen = 0;
 	uint8_t strip_sz = 0;
 	uint8_t nhdr_sz = 0;
+#if IS_ENABLED(CONFIG_XFRM_INTERFACE)
+	struct sec_path *sp = skb_sec_path(skb);
+	struct xfrm_state *xs = NULL;
+#endif
 
 	dbg("received skb====> dev=%s",dev?dev->name:"null");
 	dumpskb(skb->data, 64, 1);
 
 	spin_lock_bh(&g_tun_db_lock);
 	tunn_info = &ipsec_tun_db[tunnel_id];
+
+	/* For XFRM interface tunnels, parse the cleartext packet
+	 * for inbound S2 session learning (VPN-FW -> LAN).
+	 */
+#if IS_ENABLED(CONFIG_XFRM_INTERFACE)
+	if (sp) {
+		xs = xfrm_input_state(skb);
+		if (xs && xs->if_id) {
+			skb_reset_mac_header(skb);
+			skb->dev = dev;
+			pktprs_do_parse(skb, dev, PKTPRS_ETH_RX);
+			dbg("XFRM if_id=%u: parsed cleartext for S2 learning, dev=%s",
+			    xs->if_id, dev ? dev->name : "null");
+			goto exit;
+		}
+	}
+#endif
+
 	if (!(!list_empty(&tunn_info->sessions) && tunn_info->is_inbound))
 		goto exit;
 
@@ -3256,6 +3299,982 @@ static ssize_t proc_set_ppv4_debug(struct file *file, const char __user *buf, si
 	return len;
 }
 
+struct dbgfs_static_session_cfg {
+	PPA_IFNAME rx_if[PPA_IF_NAME_SIZE];
+	PPA_IFNAME tx_if[PPA_IF_NAME_SIZE];
+	u32 tc;
+	u32 mark;
+	u16 vlan_tci;
+	u16 rx_vlan_tci;
+	u8 vlan_add_en;
+	u8 vlan_del_en;
+	u8 rx_vlan_en;
+	struct in_addr src;
+	struct in_addr dst;
+	u16 src_port;
+	u16 dst_port;
+	u8 rx_tos;
+	u8 proto;
+	struct in_addr nat_src;
+	struct in_addr nat_dst;
+	u16 nat_src_port;
+	u16 nat_dst_port;
+	u8 nat_src_en;
+	u8 nat_dst_en;
+	u8 nat_sport_en;
+	u8 nat_dport_en;
+	u8 rx_src_mac[ETH_ALEN];
+	u8 rx_dst_mac[ETH_ALEN];
+	u8 rx_smac_en;
+	u8 rx_dmac_en;
+	u8 tx_smac[ETH_ALEN];
+	u8 tx_dmac[ETH_ALEN];
+	u8 tx_smac_en;
+	u8 tx_dmac_en;
+	u8 tcp_doff;
+	u8 tcp_doff_en;
+	u8 rx_tos_en;
+};
+
+#define DBGFS_STATIC_SESSION_REQ_SRC	BIT(0)
+#define DBGFS_STATIC_SESSION_REQ_DST	BIT(1)
+#define DBGFS_STATIC_SESSION_REQ_SPORT	BIT(2)
+#define DBGFS_STATIC_SESSION_REQ_DPORT	BIT(3)
+#define DBGFS_STATIC_SESSION_REQ_PROTO	BIT(4)
+#define DBGFS_STATIC_SESSION_REQ_ING	BIT(5)
+#define DBGFS_STATIC_SESSION_REQ_EG	BIT(6)
+#define DBGFS_STATIC_SESSION_REQ_RXSMAC	BIT(7)
+#define DBGFS_STATIC_SESSION_REQ_RXDMAC	BIT(8)
+#define DBGFS_STATIC_SESSION_REQ_ALL	(DBGFS_STATIC_SESSION_REQ_SRC | DBGFS_STATIC_SESSION_REQ_DST | \
+					 DBGFS_STATIC_SESSION_REQ_SPORT | DBGFS_STATIC_SESSION_REQ_DPORT | \
+					 DBGFS_STATIC_SESSION_REQ_PROTO | DBGFS_STATIC_SESSION_REQ_ING | \
+					 DBGFS_STATIC_SESSION_REQ_EG | DBGFS_STATIC_SESSION_REQ_RXSMAC | \
+					 DBGFS_STATIC_SESSION_REQ_RXDMAC)
+
+static int dbgfs_parse_static_session_cmd(char *cmd,
+				   struct dbgfs_static_session_cfg *cfg,
+				 u32 *mask, bool require_all)
+{
+	char *tok;
+	int parsed = 0;
+
+	while ((tok = strsep(&cmd, " \t\n")) != NULL) {
+		char *eq;
+		char *key;
+		char *val;
+		u32 port;
+
+		if (!*tok)
+			continue;
+
+		eq = strchr(tok, '=');
+		if (!eq)
+			return -EINVAL;
+
+		*eq = '\0';
+		key = tok;
+		val = eq + 1;
+
+		if (!strncmp(key, "sport", 5) || !strncmp(key, "src_port", 8)) {
+			if (kstrtou32(val, 0, &port) || port > U16_MAX)
+				return -EINVAL;
+			cfg->src_port = (u16)port;
+			*mask |= DBGFS_STATIC_SESSION_REQ_SPORT;
+			parsed++;
+		} else if (!strncmp(key, "dport", 5) || !strncmp(key, "dst_port", 8)) {
+			if (kstrtou32(val, 0, &port) || port > U16_MAX)
+				return -EINVAL;
+			cfg->dst_port = (u16)port;
+			*mask |= DBGFS_STATIC_SESSION_REQ_DPORT;
+			parsed++;
+		} else if (!strncmp(key, "sip", 3) || !strncmp(key, "src", 3) ||
+			   !strncmp(key, "src_ip", 6)) {
+			if (strchr(val, ':') ||
+			    !in4_pton(val, -1, (u8 *)&cfg->src.s_addr, -1, NULL))
+				return -EINVAL;
+			*mask |= DBGFS_STATIC_SESSION_REQ_SRC;
+			parsed++;
+		} else if (!strncmp(key, "dip", 3) || !strncmp(key, "dst", 3) ||
+			   !strncmp(key, "dst_ip", 6)) {
+			if (strchr(val, ':') ||
+			    !in4_pton(val, -1, (u8 *)&cfg->dst.s_addr, -1, NULL))
+				return -EINVAL;
+			*mask |= DBGFS_STATIC_SESSION_REQ_DST;
+			parsed++;
+		} else if (!strncmp(key, "rx_if", 5) || !strncmp(key, "ingress", 7) ||
+			   !strncmp(key, "iif", 3) || !strncmp(key, "in_if", 5)) {
+			if (strscpy(cfg->rx_if, val, PPA_IF_NAME_SIZE) < 0)
+				return -EINVAL;
+			*mask |= DBGFS_STATIC_SESSION_REQ_ING;
+			parsed++;
+		} else if (!strncmp(key, "tx_if", 5) || !strncmp(key, "egress", 6) ||
+			   !strncmp(key, "oif", 3) || !strncmp(key, "out_if", 6)) {
+			if (strscpy(cfg->tx_if, val, PPA_IF_NAME_SIZE) < 0)
+				return -EINVAL;
+			*mask |= DBGFS_STATIC_SESSION_REQ_EG;
+			parsed++;
+		} else if (!strncmp(key, "tcp_hlen", 8) ||
+			   !strncmp(key, "tcp_hdr_len", 11)) {
+			if (kstrtou32(val, 0, &port) || port < sizeof(struct tcphdr) ||
+			    port > 60 || (port % 4))
+				return -EINVAL;
+			cfg->tcp_doff = (u8)(port >> 2);
+			cfg->tcp_doff_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "tc", 2) || !strncmp(key, "prio", 4) ||
+			   !strncmp(key, "priority", 8)) {
+			if (kstrtou32(val, 0, &cfg->tc))
+				return -EINVAL;
+			parsed++;
+		} else if (!strncmp(key, "mark", 4)) {
+			if (kstrtou32(val, 0, &cfg->mark))
+				return -EINVAL;
+			parsed++;
+		} else if (!strcmp(key, "ip_tos") ||
+			   !strcmp(key, "tos")) {
+			if (kstrtou32(val, 0, &port) || port > U8_MAX)
+				return -EINVAL;
+			cfg->rx_tos = (u8)port;
+			cfg->rx_tos_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "vlan_add", 8) ||
+			   !strncmp(key, "add_vlan", 8) ||
+			   !strncmp(key, "vlan_tci", 8)) {
+			if (kstrtou32(val, 0, &port) || port > U16_MAX)
+				return -EINVAL;
+			cfg->vlan_tci = (u16)port;
+			cfg->vlan_add_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "vlan_del", 8) ||
+			   !strncmp(key, "rm_vlan", 7) ||
+			   !strncmp(key, "remove_vlan", 11)) {
+			if (kstrtou32(val, 0, &port) || port > 1)
+				return -EINVAL;
+			cfg->vlan_del_en = !!port;
+			parsed++;
+		} else if (!strncmp(key, "rx_vlan", 7) ||
+			   !strncmp(key, "ing_vlan", 8) ||
+			   !strncmp(key, "vlan_ingress", 12)) {
+			if (kstrtou32(val, 0, &port) || port > U16_MAX)
+				return -EINVAL;
+			cfg->rx_vlan_tci = (u16)port;
+			cfg->rx_vlan_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "nat_src", 7) || !strncmp(key, "snat_ip", 7)) {
+			if (strchr(val, ':') ||
+			    !in4_pton(val, -1, (u8 *)&cfg->nat_src.s_addr, -1, NULL))
+				return -EINVAL;
+			cfg->nat_src_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "nat_dst", 7) || !strncmp(key, "dnat_ip", 7)) {
+			if (strchr(val, ':') ||
+			    !in4_pton(val, -1, (u8 *)&cfg->nat_dst.s_addr, -1, NULL))
+				return -EINVAL;
+			cfg->nat_dst_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "nat_sport", 9) || !strncmp(key, "snat_port", 9)) {
+			if (kstrtou32(val, 0, &port) || port > U16_MAX)
+				return -EINVAL;
+			cfg->nat_src_port = (u16)port;
+			cfg->nat_sport_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "nat_dport", 9) || !strncmp(key, "dnat_port", 9)) {
+			if (kstrtou32(val, 0, &port) || port > U16_MAX)
+				return -EINVAL;
+			cfg->nat_dst_port = (u16)port;
+			cfg->nat_dport_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "rx_smac", 7) ||
+			   !strncmp(key, "ingress_smac", 12) ||
+			   !strncmp(key, "in_smac", 7)) {
+			if (!mac_pton(val, cfg->rx_src_mac))
+				return -EINVAL;
+			cfg->rx_smac_en = 1;
+			*mask |= DBGFS_STATIC_SESSION_REQ_RXSMAC;
+			parsed++;
+		} else if (!strncmp(key, "rx_dmac", 7) ||
+			   !strncmp(key, "ingress_dmac", 12) ||
+			   !strncmp(key, "in_dmac", 7)) {
+			if (!mac_pton(val, cfg->rx_dst_mac))
+				return -EINVAL;
+			cfg->rx_dmac_en = 1;
+			*mask |= DBGFS_STATIC_SESSION_REQ_RXDMAC;
+			parsed++;
+		} else if (!strncmp(key, "tx_smac", 7) || !strncmp(key, "smac", 4) || !strncmp(key, "src_mac", 7)) {
+			if (!mac_pton(val, cfg->tx_smac))
+				return -EINVAL;
+			cfg->tx_smac_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "tx_dmac", 7) || !strncmp(key, "dmac", 4) || !strncmp(key, "dst_mac", 7)) {
+			if (!mac_pton(val, cfg->tx_dmac))
+				return -EINVAL;
+			cfg->tx_dmac_en = 1;
+			parsed++;
+		} else if (!strncmp(key, "proto", 5)) {
+			if (!strncasecmp(val, "tcp", 3))
+				cfg->proto = IPPROTO_TCP;
+			else if (!strncasecmp(val, "udp", 3))
+				cfg->proto = IPPROTO_UDP;
+			else {
+				u32 p;
+				if (kstrtou32(val, 0, &p) || p > U8_MAX)
+					return -EINVAL;
+				cfg->proto = (u8)p;
+			}
+			*mask |= DBGFS_STATIC_SESSION_REQ_PROTO;
+			parsed++;
+		} else {
+			return -EINVAL;
+		}
+	}
+
+	if (!parsed)
+		return -EINVAL;
+
+	if ((*mask & DBGFS_STATIC_SESSION_REQ_PROTO) &&
+	    cfg->proto != IPPROTO_TCP && cfg->proto != IPPROTO_UDP)
+		return -EINVAL;
+
+	if (cfg->tcp_doff_en && cfg->proto != IPPROTO_TCP)
+		return -EINVAL;
+
+	if (require_all &&
+	    ((*mask & DBGFS_STATIC_SESSION_REQ_ALL) != DBGFS_STATIC_SESSION_REQ_ALL))
+		return -EINVAL;
+
+	return 0;
+}
+
+/**
+ * @brief Shift all pktprs proto_info offsets that are >= @from by @delta.
+ * Call after inserting or removing bytes from tx_hdr->buf so the
+ * session manager's FV/SI builder finds every protocol at the correct offset.
+ */
+static void dbgfs_static_session_shift_proto_offsets(struct pktprs_hdr *tx_hdr,
+					      u8 from, int delta)
+{
+	int p, l;
+
+	for (l = 0; l < PKTPRS_HDR_LEVEL_NUM; l++) {
+		for (p = 0; p <= PKTPRS_PROTO_LAST; p++) {
+			int off;
+
+			if (!test_bit(p, &tx_hdr->proto_bmap[l]))
+				continue;
+			off = tx_hdr->proto_info[p][l].off;
+			if (off >= from) {
+				off += delta;
+				if (off < 0)
+					off = 0;
+				else if (off > U8_MAX)
+					off = U8_MAX;
+				tx_hdr->proto_info[p][l].off = (u8)off;
+			}
+		}
+	}
+}
+
+/* Find IPv4 header offset from any parsed header level. */
+static int dbgfs_static_session_ipv4_off(struct pktprs_hdr *tx_hdr)
+{
+	int lvl;
+	int off;
+
+	if (!tx_hdr)
+		return -EINVAL;
+
+	for (lvl = 0; lvl < PKTPRS_HDR_LEVEL_NUM; lvl++) {
+		if (!PKTPRS_IS_IPV4(tx_hdr, lvl))
+			continue;
+		off = pktprs_ip_hdr_off(tx_hdr, lvl);
+		if (off >= 0)
+			return off;
+	}
+
+	return -EINVAL;
+}
+
+static int dbgfs_static_session_add_vlan(struct pktprs_hdr *tx_hdr, u16 tci)
+{
+	struct ethhdr *eth;
+	struct vlan_hdr *vh;
+	__be16 old_proto;
+
+	if (!tx_hdr || tx_hdr->buf_sz < ETH_HLEN)
+		return -EINVAL;
+
+	if (tx_hdr->buf_sz + VLAN_HLEN > PKTPRS_HDR_BUF_SIZE)
+		return -E2BIG;
+
+	eth = (struct ethhdr *)tx_hdr->buf;
+	old_proto = eth->h_proto;
+
+	memmove(tx_hdr->buf + ETH_HLEN + VLAN_HLEN,
+		tx_hdr->buf + ETH_HLEN,
+		tx_hdr->buf_sz - ETH_HLEN);
+
+	vh = (struct vlan_hdr *)(tx_hdr->buf + ETH_HLEN);
+	vh->h_vlan_TCI = htons(tci);
+	vh->h_vlan_encapsulated_proto = old_proto;
+	eth->h_proto = htons(ETH_P_8021Q);
+	tx_hdr->buf_sz += VLAN_HLEN;
+
+	/* Keep parser offsets consistent after VLAN insertion. */
+	dbgfs_static_session_shift_proto_offsets(tx_hdr, ETH_HLEN, VLAN_HLEN);
+
+	return 0;
+}
+
+static int dbgfs_static_session_del_vlan(struct pktprs_hdr *tx_hdr)
+{
+	struct ethhdr *eth;
+	struct vlan_hdr *vh;
+	__be16 inner_proto;
+	s16 off;
+
+	if (!tx_hdr)
+		return -EINVAL;
+
+	if (!PKTPRS_IS_VLAN0(tx_hdr, PKTPRS_HDR_LEVEL0))
+		return 0;
+
+	off = pktprs_hdr_off(tx_hdr, PKTPRS_PROTO_VLAN0, PKTPRS_HDR_LEVEL0);
+	if (off < 0 || (off + VLAN_HLEN) > tx_hdr->buf_sz)
+		return -EINVAL;
+
+	eth = pktprs_eth_hdr(tx_hdr, PKTPRS_HDR_LEVEL0);
+	vh = (struct vlan_hdr *)&tx_hdr->buf[off];
+	if (!eth)
+		return -EINVAL;
+
+	/* Save inner ethertype before removing VLAN from parser header. */
+	inner_proto = vh->h_vlan_encapsulated_proto;
+	if (pktprs_proto_remove(tx_hdr, PKTPRS_PROTO_VLAN0, PKTPRS_HDR_LEVEL0))
+		return -EINVAL;
+
+	/* Restore ethernet type to the encapsulated protocol. */
+	eth->h_proto = inner_proto;
+
+	return 0;
+}
+
+static int dbgfs_apply_static_session_egress_mods(struct pktprs_hdr *tx_hdr,
+				 const struct dbgfs_static_session_cfg *cfg,
+					 PPA_NETIF *eg_if,
+					 bool *vlan_add_applied,
+					 bool *vlan_del_applied)
+{
+	struct iphdr *iph;
+	unsigned int ip_len;
+	int ip_off;
+	int l4_off;
+	bool l3_addr_changed = false;
+	int ret;
+
+	(void)eg_if;
+
+	if (!tx_hdr || !cfg)
+		return -EINVAL;
+
+	if (vlan_add_applied)
+		*vlan_add_applied = false;
+	if (vlan_del_applied)
+		*vlan_del_applied = false;
+
+	if (cfg->vlan_del_en) {
+		bool had_vlan = PKTPRS_IS_VLAN0(tx_hdr, PKTPRS_HDR_LEVEL0);
+
+		ret = dbgfs_static_session_del_vlan(tx_hdr);
+		if (ret)
+			return ret;
+		if (vlan_del_applied && had_vlan)
+			*vlan_del_applied = true;
+	}
+
+	if (cfg->vlan_add_en) {
+		ret = dbgfs_static_session_add_vlan(tx_hdr, cfg->vlan_tci);
+		if (ret)
+			return ret;
+		if (vlan_add_applied)
+			*vlan_add_applied = true;
+	}
+
+	/* Keep parser context from the original template; no reparse needed. */
+
+	if (cfg->tx_dmac_en) {
+		if (ETH_ALEN > tx_hdr->buf_sz) {
+			pr_err("tx_hdr buffer too small for tx_dmac modification\n");
+			return -EINVAL;
+		}
+		if (!ether_addr_equal((u8 *)tx_hdr->buf, cfg->tx_dmac))
+			memcpy(tx_hdr->buf, cfg->tx_dmac, ETH_ALEN);
+	}
+	if (cfg->tx_smac_en) {
+		if ((ETH_ALEN + ETH_ALEN) > tx_hdr->buf_sz) {
+			pr_err("tx_hdr buffer too small for tx_smac modification\n");
+			return -EINVAL;
+		}
+		if (!ether_addr_equal((u8 *)tx_hdr->buf + ETH_ALEN, cfg->tx_smac))
+			memcpy(tx_hdr->buf + ETH_ALEN, cfg->tx_smac, ETH_ALEN);
+	}
+
+	ip_off = dbgfs_static_session_ipv4_off(tx_hdr);
+	if (ip_off < 0 || ip_off + sizeof(*iph) > tx_hdr->buf_sz) {
+		pr_err("Invalid IP header offset or buffer bounds: off=%d buf_sz=%u\n",
+		       ip_off, tx_hdr->buf_sz);
+		return -EINVAL;
+	}
+
+	iph = (struct iphdr *)&tx_hdr->buf[ip_off];
+	if (iph->version != 4) {
+		pr_err("Only IPv4 is supported in static sessions (version=%u)\n",
+		       iph->version);
+		return -EINVAL;
+	}
+	if (!iph->ttl) {
+		pr_err("Invalid IPv4 TTL 0 in static TX template\n");
+		return -EINVAL;
+	}
+
+	if (cfg->nat_src_en && iph->saddr != cfg->nat_src.s_addr) {
+		iph->saddr = cfg->nat_src.s_addr;
+		l3_addr_changed = true;
+	}
+	if (cfg->nat_dst_en && iph->daddr != cfg->nat_dst.s_addr) {
+		iph->daddr = cfg->nat_dst.s_addr;
+		l3_addr_changed = true;
+	}
+	iph->ttl--;
+
+	l4_off = ip_off + (iph->ihl << 2);
+	ip_len = ntohs(iph->tot_len);
+	{
+		unsigned int l4_min_hdr = (iph->protocol == IPPROTO_TCP) ?
+			sizeof(struct tcphdr) : sizeof(struct udphdr);
+		if (ip_len < (iph->ihl << 2) || (l4_off + l4_min_hdr > tx_hdr->buf_sz)) {
+			pr_err("Invalid IP length or L4 header bounds\n");
+			return -EINVAL;
+		}
+	}
+
+	if (iph->protocol == IPPROTO_TCP) {
+		struct tcphdr *th = (struct tcphdr *)&tx_hdr->buf[l4_off];
+		unsigned int tcp_len = ip_len - (iph->ihl << 2);
+		bool l4_port_changed = false;
+		__be16 new_sport = htons(cfg->nat_src_port);
+		__be16 new_dport = htons(cfg->nat_dst_port);
+
+		if (cfg->nat_sport_en && th->source != new_sport) {
+			th->source = new_sport;
+			l4_port_changed = true;
+		}
+		if (cfg->nat_dport_en && th->dest != new_dport) {
+			th->dest = new_dport;
+			l4_port_changed = true;
+		}
+
+		if (l3_addr_changed || l4_port_changed) {
+			th->check = 0;
+			th->check = tcp_v4_check(tcp_len, iph->saddr, iph->daddr,
+						csum_partial((char *)th, tcp_len, 0));
+		}
+	} else if (iph->protocol == IPPROTO_UDP) {
+		struct udphdr *uh = (struct udphdr *)&tx_hdr->buf[l4_off];
+		unsigned int udp_len = ip_len - (iph->ihl << 2);
+		bool l4_port_changed = false;
+		__be16 new_sport = htons(cfg->nat_src_port);
+		__be16 new_dport = htons(cfg->nat_dst_port);
+
+		if (cfg->nat_sport_en && uh->source != new_sport) {
+			uh->source = new_sport;
+			l4_port_changed = true;
+		}
+		if (cfg->nat_dport_en && uh->dest != new_dport) {
+			uh->dest = new_dport;
+			l4_port_changed = true;
+		}
+
+		if (l3_addr_changed || l4_port_changed) {
+			uh->check = 0;
+			uh->check = csum_tcpudp_magic(iph->saddr, iph->daddr, udp_len,
+						     IPPROTO_UDP,
+						     csum_partial((char *)uh, udp_len, 0));
+			if (!uh->check)
+				uh->check = CSUM_MANGLED_0;
+		}
+	}
+
+	iph->check = 0;
+	iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
+
+	return 0;
+}
+
+static int dbgfs_build_static_session_skb(const struct dbgfs_static_session_cfg *cfg,
+				  struct sk_buff **out)
+{
+	struct sk_buff *skb;
+	unsigned int l2_len;
+	unsigned int l4_len;
+	unsigned int l3_len;
+	unsigned int pkt_len;
+	unsigned int min_payload = 0;
+	unsigned int current_size;
+	unsigned int total_alloc;
+	unsigned int ip_payload_len;
+	u8 *data;
+	struct ethhdr *eth;
+	struct vlan_hdr *vh = NULL;
+	static const unsigned int MIN_STATIC_PKT_SIZE = 60;  /* Ethernet minimum frame size */
+
+	if (!cfg || !out) {
+		pr_err("Invalid parameters: cfg or out is NULL\n");
+		return -EINVAL;
+	}
+
+	l4_len = (cfg->proto == IPPROTO_TCP) ?
+		(cfg->tcp_doff_en ? (cfg->tcp_doff << 2) : sizeof(struct tcphdr)) :
+		sizeof(struct udphdr);
+	l2_len = ETH_HLEN + (cfg->rx_vlan_en ? VLAN_HLEN : 0);
+	l3_len = sizeof(struct iphdr);
+	pkt_len = l2_len + l3_len + l4_len;
+
+	/* Pad up to the minimum Ethernet frame size. */
+	current_size = pkt_len;
+	if (current_size < MIN_STATIC_PKT_SIZE) {
+		min_payload = MIN_STATIC_PKT_SIZE - current_size;
+	}
+
+	total_alloc = pkt_len + min_payload + NET_SKB_PAD;
+
+	skb = alloc_skb(total_alloc, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	skb_reserve(skb, NET_SKB_PAD);
+	data = skb_put(skb, pkt_len + min_payload);
+	memset(data, 0, pkt_len + min_payload);
+
+	eth = (struct ethhdr *)data;
+	eth->h_proto = htons(cfg->rx_vlan_en ? ETH_P_8021Q : ETH_P_IP);
+	if (cfg->rx_dmac_en)
+		memcpy(eth->h_dest, cfg->rx_dst_mac, ETH_ALEN);
+	if (cfg->rx_smac_en)
+		memcpy(eth->h_source, cfg->rx_src_mac, ETH_ALEN);
+
+	if (cfg->rx_vlan_en) {
+		vh = (struct vlan_hdr *)(data + ETH_HLEN);
+		vh->h_vlan_TCI = htons(cfg->rx_vlan_tci);
+		vh->h_vlan_encapsulated_proto = htons(ETH_P_IP);
+	}
+
+	{
+		struct iphdr *iph = (struct iphdr *)(data + l2_len);
+
+		iph->version = 4;
+		iph->ihl = sizeof(*iph) >> 2;
+		iph->ttl = 64;
+		if (cfg->rx_tos_en)
+			iph->tos = cfg->rx_tos;
+		iph->protocol = cfg->proto;
+		/* Include any padding in IP total length. */
+		ip_payload_len = l4_len + min_payload;
+		iph->tot_len = htons(l3_len + ip_payload_len);
+		iph->saddr = cfg->src.s_addr;
+		iph->daddr = cfg->dst.s_addr;
+		/* Compute checksum after all IPv4 fields are set. */
+		iph->check = 0;
+		iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
+
+		if (cfg->proto == IPPROTO_TCP) {
+			struct tcphdr *th = (struct tcphdr *)(data + l2_len + sizeof(*iph));
+
+			th->source = htons(cfg->src_port);
+			th->dest = htons(cfg->dst_port);
+			th->doff = cfg->tcp_doff_en ? cfg->tcp_doff : (sizeof(*th) >> 2);
+		} else {
+			struct udphdr *uh = (struct udphdr *)(data + l2_len + sizeof(*iph));
+
+			uh->source = htons(cfg->src_port);
+			uh->dest = htons(cfg->dst_port);
+			/* Include any padding in UDP length. */
+			uh->len = htons(sizeof(*uh) + min_payload);
+		}
+	}
+
+	skb_reset_mac_header(skb);
+	skb_set_network_header(skb, l2_len);
+	skb_set_transport_header(skb, l2_len + l3_len);
+	skb->protocol = eth->h_proto;
+	skb->priority = cfg->tc;
+	skb->mark = cfg->mark;
+
+	*out = skb;
+	return 0;
+}
+
+static PPA_NETIF *dbgfs_static_session_resolve_netif(const char *ifname)
+{
+	PPA_NETIF *netif;
+
+	if (!ifname || !ifname[0])
+		return NULL;
+
+	/* Fast path: direct device lookup by the provided name */
+	netif = ppa_get_netif(ifname);
+	if (netif)
+		return netif;
+
+	/*
+	 * Fallback: resolve the name explicitly in init_net.
+	 * Use only exported APIs in this module path.
+	 */
+	netif = ppa_get_netif_by_net(&init_net, ifname);
+
+	return netif;
+}
+
+static int dbgfs_create_static_session(const struct dbgfs_static_session_cfg *cfg,
+				       u32 *session_id)
+{
+	struct sk_buff *skb = NULL;
+	struct pktprs_hdr *rx_hdr, *tx_hdr = NULL;
+	struct pp_sess_create_args *args = NULL;
+	PPA_NETIF *ing_if = NULL, *eg_if = NULL;
+	struct uc_session_node *tmp_item = NULL;
+	struct pktprs_desc *desc = NULL;
+	PPA_SUBIF *ing_subif = NULL, *eg_subif = NULL;
+	bool vlan_add_applied = false;
+	bool vlan_del_applied = false;
+	int ret;
+
+	args = kzalloc(sizeof(*args), GFP_KERNEL);
+	tmp_item = kzalloc(sizeof(*tmp_item), GFP_KERNEL);
+	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	ing_subif = kzalloc(sizeof(*ing_subif), GFP_KERNEL);
+	eg_subif = kzalloc(sizeof(*eg_subif), GFP_KERNEL);
+	if (!args || !tmp_item || !desc || !ing_subif || !eg_subif) {
+		ret = -ENOMEM;
+		goto done;
+	}
+	mc_sess_args_prepare(args);
+
+	ret = dbgfs_build_static_session_skb(cfg, &skb);
+	if (ret)
+		goto done;
+
+	dbg("static create req rx_if=%s tx_if=%s proto=%u sport=%u dport=%u tc=%u mark=%u",
+	    cfg->rx_if, cfg->tx_if, cfg->proto, cfg->src_port,
+	    cfg->dst_port, cfg->tc, cfg->mark);
+	if (!cfg->rx_smac_en || !cfg->rx_dmac_en)
+		pr_warn("static session created without full ingress L2 match (rx_smac/rx_dmac). Session may not be hit by live traffic.\n");
+	if (cfg->proto == IPPROTO_TCP && !cfg->tcp_doff_en)
+		pr_warn("static TCP session uses default tcp_hlen=20. Live TCP flows with options may not hit; set tcp_hlen to match traffic.\n");
+
+	ing_if = dbgfs_static_session_resolve_netif(cfg->rx_if);
+	if (!ing_if) {
+		pr_err("invalid rx_if: %s (not found in netdev/PPA interface tables)\n",
+		       cfg->rx_if);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	eg_if = dbgfs_static_session_resolve_netif(cfg->tx_if);
+	if (!eg_if) {
+		pr_err("invalid tx_if: %s (not found in netdev/PPA interface tables)\n",
+		       cfg->tx_if);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	skb->dev = ing_if;
+	pktprs_do_parse(skb, skb->dev, PKTPRS_ETH_RX);
+	rx_hdr = pktprs_skb_hdr_get(skb);
+	if (!rx_hdr) {
+		ret = -EINVAL;
+		goto done;
+	}
+
+	tx_hdr = kzalloc(sizeof(*tx_hdr), GFP_KERNEL);
+	if (!tx_hdr) {
+		ret = -ENOMEM;
+		goto done;
+	}
+	memcpy(tx_hdr, rx_hdr, sizeof(*tx_hdr));
+	tx_hdr->ifindex = eg_if->ifindex;
+	ret = dbgfs_apply_static_session_egress_mods(tx_hdr, cfg, eg_if,
+					      &vlan_add_applied,
+					      &vlan_del_applied);
+	if (ret) {
+		pr_err("failed applying static egress modifications\n");
+		goto done;
+	}
+
+	if (dp_get_netif_subifid(ing_if, skb, NULL, NULL, ing_subif, 0)) {
+		pr_err("dp_get_netif_subifid failed for rx_if: %s\n",
+		       cfg->rx_if);
+		ret = -EINVAL;
+		goto done;
+	}
+	if (dp_get_netif_subifid(eg_if, NULL, NULL, NULL, eg_subif, 0)) {
+		pr_err("dp_get_netif_subifid failed for tx_if: %s\n",
+		       cfg->tx_if);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	tmp_item->tx_if = eg_if;
+	tmp_item->pkt.priority = cfg->tc;
+	tmp_item->pkt.mark = cfg->mark;
+#ifdef HAVE_QOS_EXTMARK
+	/* Mirror mark into extmark on extmark-enabled builds. */
+	tmp_item->pkt.extmark = cfg->mark;
+#endif
+	if (vlan_add_applied)
+		tmp_item->flags |= SESSION_VALID_VLAN_INS;
+	if (vlan_del_applied)
+		tmp_item->flags |= SESSION_VALID_VLAN_RM;
+	desc->skb = skb;
+	desc->tx = tx_hdr;
+
+	ret = set_egress_port_n_queue(tmp_item, args, desc, eg_subif);
+	if (ret != PPA_SUCCESS) {
+		pr_err("set_egress_port_n_queue failed for tx_if: %s ret=%d\n",
+		       cfg->tx_if, ret);
+		goto done;
+	}
+
+	args->in_port = ing_subif->gpid;
+	if ((eg_subif->alloc_flag & DP_F_VUNI) &&
+	    (eg_subif->data_flag & DP_SUBIF_VANI)) {
+		PPA_SUBIF vuni_subif = {0};
+
+		if (dp_get_netif_subifid(eg_subif->associate_netif, NULL, NULL,
+					 NULL, &vuni_subif, 0)) {
+			pr_err("dp_get_netif_subifid failed for VUNI associate netif\n");
+			ret = -EINVAL;
+			goto done;
+		}
+		args->eg_port = vuni_subif.gpid;
+		args->ps = vuni_subif.subif & 0xFFFF;
+	} else if (eg_subif->alloc_flag & DP_F_DOCSIS) {
+		set_bit(PP_SESS_FLAG_DOCSIS_BIT, &args->flags);
+		args->ps = skb->DW0;
+	} else {
+		args->ps = eg_subif->subif & 0xFFFF;
+		if (!(eg_subif->alloc_flag & DP_F_ACA))
+			args->ps |= BIT(27);
+		if (eg_subif->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
+			args->ps |= (tmp_item->pkt.priority & 0xF) << 24;
+			args->ps |= (tmp_item->pkt.priority & 0xF) << 28;
+		}
+	}
+	set_bit(PP_SESS_FLAG_PS_VALID_BIT, &args->flags);
+
+	/* RX drives matching; TX carries egress context and rewrite template. */
+	args->tx = tx_hdr;
+	args->rx = rx_hdr;
+	dbg("static session rx_ifindex=%d tx_ifindex=%d eg_port=%u dst_q=%u ps=0x%x",
+	    args->rx->ifindex, args->tx->ifindex, args->eg_port,
+	    args->dst_q, args->ps);
+	set_bit(PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT, &args->flags);
+	/* Keep high queue aligned with default queue when not set. */
+	if (args->dst_q_high == (uint32_t)-1 || args->dst_q_high == 0)
+		args->dst_q_high = args->dst_q;
+
+
+	if (!session_id) {
+		pr_err("session_id pointer is NULL\n");
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = pp_session_create(args, session_id, NULL);
+	if (!ret) {
+		dbg("static session hash h1=0x%x h2=0x%x sig=0x%x",
+		    args->hash.h1, args->hash.h2, args->hash.sig);
+		pr_info("static session PP id=%u\n", *session_id);
+	}
+done:
+	if (eg_if)
+		ppa_put_netif(eg_if);
+	if (ing_if)
+		ppa_put_netif(ing_if);
+	kfree(eg_subif);
+	kfree(ing_subif);
+	kfree(desc);
+	kfree(tmp_item);
+	kfree(args);
+	kfree(tx_hdr);
+	kfree_skb(skb);
+	return ret;
+}
+
+static int dbg_read_ppv4_static_sess(struct seq_file *seq, void *v)
+{
+	if (!capable(CAP_SYSLOG)) {
+		pr_err("Read Permission denied\n");
+		return 0;
+	}
+
+	seq_puts(seq, "Static Session DebugFS\n");
+	seq_puts(seq, "======================\n\n");
+	seq_puts(seq, "Manually inject a 5-tuple IP session directly into the PP hardware.\n");
+	seq_puts(seq, "Useful for testing acceleration without live traffic.\n\n");
+
+	seq_puts(seq, "Create PP session:\n");
+	seq_puts(seq,
+		 "  echo 'rx_if=<ifname> tx_if=<ifname> rx_smac=<mac> rx_dmac=<mac>\n"
+		 "        sip=<IPv4> dip=<IPv4> sport=<port> dport=<port>\n"
+		 "        proto=<tcp|udp> [options]' >\n"
+		 "  /sys/kernel/debug/ppa/hal/pp/static_session\n");
+
+	seq_puts(seq, "\nParameters:\n");
+	seq_puts(seq,
+		 "  rx_if tx_if rx_smac rx_dmac sip dip sport dport proto\n"
+		 "  [tc] [mark] [ip_tos] [tcp_hlen] [rx_vlan]\n"
+		 "  [nat_src] [nat_dst] [nat_sport] [nat_dport]\n"
+		 "  [tx_smac] [tx_dmac] [vlan_add] [vlan_del]\n");
+
+	seq_puts(seq, "\nNotes:\n");
+	seq_puts(seq, "  - rx_smac/rx_dmac are required ingress packet match keys.\n");
+	seq_puts(seq, "  - rx_vlan and ip_tos are optional ingress qualifiers; if omitted, ingress template is untagged IPv4 with TOS=0x00.\n");
+	seq_puts(seq, "  - Set ip_tos=<0-255> to match non-zero ingress IPv4 ToS/DSCP+ECN.\n");
+	seq_puts(seq, "  - For tagged ingress matching, set rx_vlan=<tci> (example: rx_vlan=0x000d).\n");
+	seq_puts(seq, "  - For TCP flows with options (e.g. timestamps), set tcp_hlen to match\n"
+		      "    the actual ingress TCP header size (e.g. tcp_hlen=32 for timestamps).\n");
+	seq_puts(seq, "  - TTL is decremented automatically in the egress rewrite template.\n\n");
+
+	seq_puts(seq, "Help:\n");
+	seq_puts(seq, "  echo 'help' > /sys/kernel/debug/ppa/hal/pp/static_session\n");
+
+	seq_puts(seq, "\nDelete PP session:\n");
+	seq_puts(seq, "  echo 'id=<PP Session Id>' > /sys/kernel/debug/pp/sess_mgr/delete_session\n");
+
+	seq_puts(seq, "\nExample (UDP with SNAT):\n");
+	seq_puts(seq,
+		 "  echo 'rx_if=eth0 tx_if=eth1 "
+		 "rx_smac=00:01:02:03:04:05 rx_dmac=00:11:22:33:44:55 "
+		 "sip=192.168.1.10 dip=8.8.8.8 sport=12345 dport=53 proto=udp "
+		 "nat_src=10.0.0.2 tx_dmac=66:77:88:99:aa:bb' > "
+		 "/sys/kernel/debug/ppa/hal/pp/static_session\n");
+
+	seq_puts(seq, "\nExample (VLAN add):\n");
+	seq_puts(seq,
+		 "  echo 'rx_if=eth0_1 tx_if=eth1 "
+		 "rx_smac=00:10:94:00:00:02 rx_dmac=00:e0:92:00:01:41 "
+		 "sip=192.168.1.100 dip=10.10.10.1 sport=1024 dport=1024 proto=udp "
+		 "nat_src=10.10.10.2 tx_dmac=00:10:94:00:00:05 vlan_add=0xE00D' > "
+		 "/sys/kernel/debug/ppa/hal/pp/static_session\n");
+
+	seq_puts(seq, "\nExample (VLAN delete):\n");
+	seq_puts(seq,
+		 "  echo 'rx_if=eth1 tx_if=eth0_1 "
+		 "rx_smac=00:10:94:00:00:04 rx_dmac=00:e0:92:00:01:40 "
+		 "rx_vlan=0 sip=10.10.10.1 dip=192.168.1.100 sport=1024 dport=1024 proto=udp "
+		 "nat_dst=192.168.1.100 vlan_del=1 ip_tos=0x00 tx_dmac=00:10:94:00:00:01' > "
+		 "/sys/kernel/debug/ppa/hal/pp/static_session\n");
+
+	return 0;
+}
+
+static int dbg_read_ppv4_static_sess_seq_open(struct inode *inode,
+		struct file *file)
+{
+	return single_open(file, dbg_read_ppv4_static_sess, NULL);
+}
+
+static ssize_t dbg_set_ppv4_static_sess(struct file *file,
+		const char __user *buf, size_t count, loff_t *data)
+{
+	char *str = NULL, *opbuf = NULL, *cmd, *work, *op;
+	int len;
+	int ret = 0;
+	u32 mask = 0;
+	struct dbgfs_static_session_cfg *cfg = NULL;
+	u32 session_id = 0;
+
+	if (!capable(CAP_NET_ADMIN)) {
+		pr_err("Write Permission denied\n");
+		return -EPERM;
+	}
+
+	str = kzalloc(256, GFP_KERNEL);
+	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+	if (!str || !cfg) {
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	len = min_t(size_t, count, 255);
+	len -= ppa_copy_from_user(str, buf, len);
+	if (len < 0) {
+		pr_err("copy_from_user failed\n");
+		ret = -EFAULT;
+		goto done;
+	}
+	str[len] = '\0';
+	cmd = strim(str);
+	if (!*cmd) {
+		ret = count;
+		goto done;
+	}
+
+	opbuf = kstrdup(cmd, GFP_KERNEL);
+	if (!opbuf) {
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	work = opbuf;
+	op = strsep(&work, " \t\n");
+	if ((op && !strncmp(op, "help", 4)) || !strncmp(cmd, "help=", 5)) {
+		pr_info("static_session usage:\n");
+		pr_info("  create : rx_if=<ifname> tx_if=<ifname> rx_smac=<mac> rx_dmac=<mac> sip=<IPv4> dip=<IPv4> sport=<port> dport=<port> proto=<tcp|udp> [options]\n");
+		pr_info("  options: tc=<0-7> mark=<num> ip_tos=<0-255> tcp_hlen=<20-60> rx_vlan=<tci> vlan_add=<tci> vlan_del=<0|1> nat_src=<IPv4> nat_dst=<IPv4> nat_sport=<port> nat_dport=<port> tx_smac=<mac> tx_dmac=<mac>\n");
+		pr_info("  example: echo 'rx_if=eth0 tx_if=eth1 rx_smac=00:01:02:03:04:05 rx_dmac=00:11:22:33:44:55 sip=192.168.1.10 dip=8.8.8.8 sport=12345 dport=53 proto=udp nat_src=10.0.0.2 tx_dmac=66:77:88:99:aa:bb' > /sys/kernel/debug/ppa/hal/pp/static_session\n");
+		pr_info("  example: echo 'rx_if=eth0_1 tx_if=eth1 rx_smac=00:10:94:00:00:02 rx_dmac=00:e0:92:00:01:41 sip=192.168.1.100 dip=10.10.10.1 sport=1024 dport=1024 proto=udp nat_src=10.10.10.2 tx_dmac=00:10:94:00:00:05 vlan_add=0xE00D' > /sys/kernel/debug/ppa/hal/pp/static_session\n");
+		pr_info("  example: echo 'rx_if=eth1 tx_if=eth0_1 rx_smac=00:10:94:00:00:04 rx_dmac=00:e0:92:00:01:40 rx_vlan=0 sip=10.10.10.1 dip=192.168.1.100 sport=1024 dport=1024 proto=udp nat_dst=192.168.1.100 vlan_del=1 ip_tos=0x00 tx_dmac=00:10:94:00:00:01' > /sys/kernel/debug/ppa/hal/pp/static_session\n");
+		pr_info("  note   : rx_smac/rx_dmac are required ingress packet match keys.\n");
+		pr_info("  note   : rx_vlan/ip_tos are optional; if omitted, ingress template defaults to untagged IPv4 with TOS=0x00.\n");
+		pr_info("  note   : for TCP flows with options, set tcp_hlen to match the live ingress TCP header (timestamps usually mean tcp_hlen=32).\n");
+		ret = count;
+		goto done;
+	}
+
+	memset(cfg, 0, sizeof(*cfg));
+	ret = dbgfs_parse_static_session_cmd(cmd, cfg, &mask, true);
+	if (ret) {
+		pr_err("invalid input. required: rx_if=<ifname> tx_if=<ifname> rx_smac=<mac> rx_dmac=<mac> sip=<IPv4> dip=<IPv4> sport=<port> dport=<port> proto=<tcp|udp>\n");
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = dbgfs_create_static_session(cfg, &session_id);
+	if (ret) {
+		pr_err("static session create failed ret=%d rx_if=%s tx_if=%s\n",
+		       ret, cfg->rx_if, cfg->tx_if);
+		goto done;
+	}
+
+	if (session_id == 0) {
+		pr_warn("static session created with invalid id=0\n");
+	}
+
+	pr_info("static session created: id=%u rx_if=%s tx_if=%s "
+		"proto=%u sport=%u dport=%u tc=%u mark=%u\n",
+		session_id, cfg->rx_if, cfg->tx_if, cfg->proto,
+		cfg->src_port, cfg->dst_port, cfg->tc, cfg->mark);
+
+	ret = count;
+
+done:
+	kfree(opbuf);
+	kfree(cfg);
+	kfree(str);
+	return ret;
+}
+
 #if IS_ENABLED(CONFIG_PPA_BBF247_MODE1)
 static int ppa_run_cmd(const char *cmd)
 {
@@ -3859,6 +4878,7 @@ static struct ppa_debugfs_files lgm_hal_debugfs_files[] = {
 #endif
 	{ "supp-accel",       0600, &dbgfs_file_ppv4_support_accel_seq_fops },
 	{ "mc_db",            0600, &dbgfs_file_ppv4_mcdb_seq_fops },
+	{ "static_session",   0600, &dbgfs_file_ppv4_static_sess_fops },
 };
 
 static struct ppa_debugfs_files pphal_fbm_debugfs_files[] = {
@@ -4829,6 +5849,129 @@ static void check_aqm_lld_for_docsis(PPA_SUBIF *dp_port,
 	}
 }
 
+static void set_lro_qid_n_flowid(struct pp_sess_create_args *rt_entry,
+				 PPA_LRO_INFO *lro_entry)
+{
+	/*LRO qid as returned from the lro conn*/
+	rt_entry->dst_q = lro_entry->dst_q;
+	/*set the lro flowid */
+	rt_entry->lro_info = lro_entry->session_id;
+}
+
+static int32_t update_non_lro_eg_queue_n_flags(struct pktprs_desc *desc,
+					struct pp_sess_create_args *rt_entry,
+					struct dp_qos_q_logic *q_logic,
+					PPA_SUBIF *dp_port,
+					bool sk_gro_support)
+{
+	bool wifi_rx_dev = false;
+	PPA_NETIF *netif = ppa_dev_get_by_index(desc->rx->ifindex);
+
+	if (!netif) {
+		dbg("Invalid netif \n");
+		ppa_free(dp_port);
+		return PPA_FAILURE;
+	}
+	dbg("Non LRO PPV4 Sesion\n");
+
+	wifi_rx_dev = ppa_is_netif_wifi(netif);
+	if (wifi_rx_dev) {
+		q_logic->q_id = get_cpu_qid(smp_processor_id(), QIDPATH_WIFI_RX);
+
+		if (dp_qos_get_q_logic(q_logic, 0) == DP_FAILURE) {
+			pr_err("%s:%d ERROR Failed to Logical Queue Id\n",
+					__func__, __LINE__);
+			ppa_put_netif(netif);
+			ppa_free(dp_port);
+			return PPA_FAILURE;
+		}
+		dbg("q_id = %d q_logic_id = %d is_wifi_rx_dev = %d dev %s\n",
+			q_logic->q_id, q_logic->q_logic_id, wifi_rx_dev,
+			netdev_name(netif));
+		rt_entry->dst_q = q_logic->q_logic_id;
+	}
+	ppa_put_netif(netif);
+
+	if (!sk_gro_support || wifi_rx_dev) {
+		if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry->flags)) {
+			clear_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry->flags);
+			dbg("cleared SLRO info bit\n");
+		}
+	}
+
+	return PPA_SUCCESS;
+}
+
+static int32_t set_cpu_in_default_eg_port_n_queue(struct pp_sess_create_args *rt_entry,
+					   struct dp_qos_q_logic *q_logic,
+					   PPA_SUBIF *dp_port)
+{
+	rt_entry->eg_port = get_cpu_portinfo();
+	rt_entry->tmp_ud_sz = COPY_16BYTES;
+	rt_entry->dst_q_high = -1;
+
+	q_logic->q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
+	if (dp_qos_get_q_logic(q_logic, 0) == DP_FAILURE) {
+		pr_err("%s:%d ERROR Failed to Logical Queue Id\n",
+		       __func__, __LINE__);
+		dbg("cpu-in default q lookup failed: cpu=%d q_id=%d eg_port=%u tmp_ud_sz=%u dst_q_high=%d\n",
+		    smp_processor_id(), q_logic->q_id, rt_entry->eg_port,
+		    rt_entry->tmp_ud_sz, rt_entry->dst_q_high);
+		ppa_free(dp_port);
+		return PPA_FAILURE;
+	}
+	rt_entry->dst_q = q_logic->q_logic_id;
+	dbg("cpu-in default q lookup OK: cpu=%d q_id=%d eg_port=%u tmp_ud_sz=%u dst_q_high=%d\n",
+		    smp_processor_id(), q_logic->q_id, rt_entry->eg_port,
+		    rt_entry->tmp_ud_sz, rt_entry->dst_q_high);
+	return PPA_SUCCESS;
+}
+
+static int32_t udp_sk_lookup(struct pktprs_desc *desc,
+			     struct udphdr *uh,
+			     struct sock **sk,
+			     PPA_SUBIF *dp_port)
+{
+	switch (ntohs(desc->skb->protocol)) {
+	case ETH_P_IP:
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 10, 110)
+		*sk = udp4_lib_lookup_skb(desc->skb, uh->source, uh->dest);
+#else
+		*sk = __udp4_lib_lookup(dev_net(desc->skb->dev), ip_hdr(desc->skb)->saddr,
+				       uh->source, ip_hdr(desc->skb)->daddr, uh->dest,
+				       inet_iif(desc->skb), inet_sdif(desc->skb),
+				       &udp_table, NULL);
+#endif
+		break;
+#if IS_ENABLED(CONFIG_IPV6)
+	case ETH_P_IPV6:
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 10, 110)
+		*sk = udp6_lib_lookup_skb(desc->skb, uh->source, uh->dest);
+#else
+		*sk = __udp6_lib_lookup(dev_net(desc->skb->dev),
+				       &ipv6_hdr(desc->skb)->saddr, uh->source,
+				       &ipv6_hdr(desc->skb)->daddr, uh->dest,
+				       inet6_iif(desc->skb), inet6_sdif(desc->skb),
+				       &udp_table, NULL);
+#endif
+		break;
+#endif /* CONFIG_IPV6 */
+	default:
+		ppa_free(dp_port);
+		dbg("%s Unsupported protocol:%x", __func__,
+		    ntohs(desc->skb->protocol));
+		return PPA_FAILURE;
+	}
+
+	if (unlikely(!*sk)) {
+		dbg("%s invalid socket!", __func__);
+		ppa_free(dp_port);
+		return PPA_FAILURE;
+	}
+
+	return PPA_SUCCESS;
+}
+
 /*!
 	\fn int32_t add_routing_entry(PPA_ROUTING_INFO *route_info)
 	\ingroup PPA_lgm_pp_hal_GLOBAL_FUNCTIONS
@@ -4843,7 +5986,6 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 	PPA_SUBIF *dp_port;
 	PPA_SUBIF *dp_port_vuni;
 #if IS_ENABLED(CONFIG_LGM_TOE)
-	bool sk_gro_support = 1;
 	PPA_LRO_INFO lro_entry = {0};
 	struct dp_qos_q_logic q_logic = {0};
 #endif /*IS_ENABLED(CONFIG_LGM_TOE)*/
@@ -5012,14 +6154,20 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 		if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
 		    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
 #if IS_ENABLED(CONFIG_LGM_TOE)
+			bool sk_gro_support = true;
+			/* set default eq port & qos */
+			if (set_cpu_in_default_eg_port_n_queue(&rt_entry, &q_logic, dp_port) != PPA_SUCCESS)
+				return PPA_FAILURE;
+
 			if (!ppa_bypass_lro(desc->skb)) {
 				/*add lro entry in PP and lro engine */
 				ppa_memset(&lro_entry,0,sizeof(lro_entry));
 
+				if (is_hw_litepath_enabled())
+					set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
+
 				if (p_item->flags & SESSION_IS_TCP) {
 					/*Set the session flags */
-					if (is_hw_litepath_enabled())
-						set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
 					lro_entry.lro_type = LRO_TYPE_TCP;
 					/*check mptcp options and if yes set
 					lro_entry.lro_type = LRO_TYPE_MPTCP;
@@ -5035,43 +6183,13 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 						return PPA_FAILURE;
 					}
 					rcu_read_lock();
-					switch (ntohs(desc->skb->protocol)) {
-					case ETH_P_IP:
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 10, 110)
-						sk = udp4_lib_lookup_skb(desc->skb, uh->source, uh->dest);
-#else
-						sk = __udp4_lib_lookup(dev_net(desc->skb->dev), ip_hdr(desc->skb)->saddr, uh->source,
-								ip_hdr(desc->skb)->daddr, uh->dest, inet_iif(desc->skb),
-								inet_sdif(desc->skb), &udp_table, NULL);
-#endif
-						break;
-#if IS_ENABLED(CONFIG_IPV6)
-					case ETH_P_IPV6:
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 10, 110)
-						sk = udp6_lib_lookup_skb(desc->skb, uh->source, uh->dest);
-#else
-						sk = __udp6_lib_lookup(dev_net(desc->skb->dev), &ipv6_hdr(desc->skb)->saddr, uh->source,
-								&ipv6_hdr(desc->skb)->daddr, uh->dest, inet6_iif(desc->skb),
-								inet6_sdif(desc->skb), &udp_table, NULL);
-#endif
-						break;
-#endif /* CONFIG_IPV6 */
-					default:
+					if (udp_sk_lookup(desc, uh, &sk,
+							  dp_port) != PPA_SUCCESS) {
 						rcu_read_unlock();
-						ppa_free(dp_port);
-						dbg("%s Unsupported protocol:%x", __func__, ntohs(desc->skb->protocol));
 						return PPA_FAILURE;
 					}
-					if (is_hw_litepath_enabled())
-						set_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
-
 					lro_entry.lro_type = LRO_TYPE_UDP;
-					if (unlikely(!sk)) {
-						dbg("%s invalid socket!", __func__);
-						rcu_read_unlock();
-						ppa_free(dp_port);
-						return PPA_FAILURE;
-					} else if (!udp_sk(sk)->gro_enabled) {
+					if (!udp_sk(sk)->gro_enabled) {
 						dbg("%s udp socket can't accept GRO/LRO packets", __func__);
 						sk_gro_support = 0;
 					}
@@ -5080,100 +6198,34 @@ int32_t add_routing_entry(PPA_ROUTING_INFO *route)
 
 				if (sk_gro_support &&
 					!test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags) &&
+					(lro_entry.lro_type == LRO_TYPE_TCP) &&
 					add_lro_entry(&lro_entry) == PPA_SUCCESS) {
 					/* use lro hw only when soft lro flag is off */
 					dbg("lro entry added\n");
 					p_item->flag2 |= SESSION_FLAG2_LRO;
 					p_item->lro_sessid = lro_entry.session_id;
-					/*cpu gpid if litepath offload is not enabled*/
-					rt_entry.eg_port = get_cpu_portinfo();
-					/*LRO qid as returned from the lro conn*/
-					rt_entry.dst_q = lro_entry.dst_q;
-					rt_entry.dst_q_high = -1;
-					/*set the lro flowid */
-					rt_entry.lro_info = lro_entry.session_id;
-
-					/*Set the number of Template UD bytes to copy*/
-					rt_entry.tmp_ud_sz = COPY_16BYTES;
-
+					set_lro_qid_n_flowid(&rt_entry, &lro_entry);
 					/*Set the session flags */
 					set_bit(PP_SESS_FLAG_LRO_INFO_BIT, &rt_entry.flags);
 				} else {
-					dbg("lro entry add failed\n");
-					rt_entry.eg_port = get_cpu_portinfo();
-					rt_entry.tmp_ud_sz = COPY_16BYTES;
-					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
-
-					if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
-						pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
-						ppa_free(dp_port);
-						return PPA_FAILURE;
-					}
-					rt_entry.dst_q = q_logic.q_logic_id;
-#if !IS_ENABLED(LITEPATH_HW_OFFLOAD)
-					/*HW offload is not enabled session cannot be accelerated*/
-					p_item->flags |= SESSION_NOT_ACCELABLE;
-					ppa_free(dp_port);
-					return PPA_FAILURE;
-#endif /*IS_ENABLED(LITEPATH_HW_OFFLOAD)*/
+					dbg("HW-LRO entry not added\n");
 					goto non_lro_ppv4_session;
 				}
 			} else {
 non_lro_ppv4_session:
-				bool wifi_rx_dev = false;
-				PPA_NETIF *netif = ppa_dev_get_by_index(desc->rx->ifindex);
-
-				if (!netif) {
-					dbg("Invalid netif \n");
-					ppa_free(dp_port);
+				if (update_non_lro_eg_queue_n_flags(desc, &rt_entry,
+							    &q_logic, dp_port,
+							    sk_gro_support) != PPA_SUCCESS)
 					return PPA_FAILURE;
-				}
-
-				rt_entry.eg_port = get_cpu_portinfo();
-				rt_entry.tmp_ud_sz = COPY_16BYTES;
-
-				wifi_rx_dev = ppa_is_netif_wifi(netif);
-				if (wifi_rx_dev)
-					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_WIFI_RX);
-				else
-					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
-
-
-				if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
-					pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
-					ppa_free(dp_port);
-					ppa_put_netif(netif);
-					return PPA_FAILURE;
-				}
-				dbg("q_logic: q_id = %d q_logic_id = %d is_wifi_rx_dev = %d dev %s\n",
-					q_logic.q_id, q_logic.q_logic_id, wifi_rx_dev,
-				        desc->skb->dev ? netdev_name(netif) : "NULL");
-				ppa_put_netif(netif);
-				rt_entry.dst_q = q_logic.q_logic_id;
-				rt_entry.dst_q_high = -1;
-				/* no soft lro session if sk doesn't support or rx-dev is wifi */
-				if (!sk_gro_support || wifi_rx_dev) {
-					dbg("Non LRO PPV4 Sesion\n");
-					if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags)) {
-						clear_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags);
-						dbg("clearing SLRO info flag\n");
-					}
-				}
 			}
 #endif /*CONFIG_LGM_TOE*/
-
 #if IS_ENABLED(LITEPATH_HW_OFFLOAD)
 			/*Set the gpid and qid of lpdev device*/
 			if (is_hw_litepath_enabled()) {
 				rt_entry.eg_port = ppa_get_lp_gpid();
 				if (test_bit(PP_SESS_FLAG_SLRO_INFO_BIT, &rt_entry.flags)) {
-					q_logic.q_id = get_cpu_qid(smp_processor_id(), QIDPATH_NORMAL);
-					if (dp_qos_get_q_logic(&q_logic, 0) == DP_FAILURE) {
-						pr_err("%s:%d ERROR Failed to Logical Queue Id\n", __func__, __LINE__);
-						ppa_free(dp_port);
-						return PPA_FAILURE;
-					}
-					pp_lro_q_set(q_logic.q_logic_id);
+					dbg("PPv4 SLRO (qid:%d)\n", rt_entry.dst_q);
+					pp_lro_q_set(rt_entry.dst_q);
 				}
 			}
 #endif /*IS_ENABLED(LITEPATH_HW_OFFLOAD)*/
@@ -5347,16 +6399,10 @@ non_lro_ppv4_session:
 		/* get tunnel id from original descriptor */
 		tun_info = &ipsec_tun_db[tunn_id];
 		if (!is_ipsec_tunnel_id_valid(tunn_id) || !tun_info->valid) {
-			dbg("Invalid ipsec tunnel id %u, ps %#lx\n",
-			    tunn_id, ps);
-			ppa_free(dp_port);
-			return PPA_FAILURE;
-		}
-
-		/* the only real usecase we need this is inbound transport mode
-		 * w/o IP tunnels
-		 */
-		if (tun_info->trns_mode && tun_info->is_inbound) {
+			/* XFRM tunnels don't use ipsec_tun_db; skip fixup */
+			dbg("ipsec tunnel id %u not valid, skipping transport fixup\n",
+			    tunn_id);
+		} else if (tun_info->trns_mode && tun_info->is_inbound) {
 			/* the change we want to reflect is from esp to
 			 * whatever we have in the tx
 			 */
