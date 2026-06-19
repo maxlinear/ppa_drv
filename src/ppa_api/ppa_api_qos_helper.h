@@ -48,6 +48,16 @@ int32_t ppa_qos_helper_dev_add(PPA_NETIF *dev);
 int32_t ppa_qos_helper_dev_modify(PPA_NETIF *oldif, PPA_NETIF *newif);
 
 /**
+ * @brief Refresh cached DPM subif state (dfl_eg_sess[]/alloc_flag/def_q/dpid)
+ *        for an interface already tracked by the QoS helper. Must be invoked
+ *        when DPM may have re-allocated the subif at runtime (e.g. WiFi
+ *        disable/enable). Does not touch the qid_map[] populated by tc events.
+ * @param net device.
+ * @return PPA_SUCCESS/PPA_FAILURE
+ */
+int32_t ppa_qos_helper_dev_refresh(PPA_NETIF *dev);
+
+/**
  * @brief Remove device from helper db.
  * @param netdevice.
  * @return PPA_SUCCESS/PPA_FAILURE

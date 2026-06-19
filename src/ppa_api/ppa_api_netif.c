@@ -89,6 +89,7 @@ static void __ppa_netif_remove(struct netif_info *p_ifinfo);
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
 extern int32_t is_lpdev(struct net_device *dev);
 #endif
+extern bool ppa_is_netif_wifi(PPA_NETIF *net_if);
 
 /* ####################################
  *		   Global Variable
@@ -1092,7 +1093,6 @@ static void ppa_netif_up(PPA_NETIF *netif)
 {
 	struct netif_info *p_ifinfo = NULL;
 	PPA_IFNAME *ifname = NULL;
-	dp_subif_t *dp_subif = NULL;
 
 	/* ppa_get_physical_if() fails for pppoe net_dev because call to
 	 * ppa_check_is_pppoe_netif() also validated only if pppoe_addr
@@ -1106,23 +1106,17 @@ static void ppa_netif_up(PPA_NETIF *netif)
 	if (ifname == NULL)
 		return;
 
-	dp_subif = ppa_malloc(sizeof(dp_subif_t));
-	if (!dp_subif) {
-		ppa_debug(DBG_ENABLE_MASK_ERR,
-			"[%s:%d] DP subif allocation failed\n", __func__, __LINE__);
-		return;
-	} else {
-		ppa_memset (dp_subif, 0, sizeof(dp_subif_t));
-		if (dp_get_netif_subifid(netif, NULL, NULL, NULL, dp_subif, 0) == DP_SUCCESS) {
-			if (dp_subif->alloc_flag & (DP_F_FAST_WLAN | DP_F_FAST_WLAN_EXT)) {
-				if (ppa_netif_add(ifname, NETIF_LAN_IF, NULL, NULL, 0) != PPA_SUCCESS)
-					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "ppa_netif_add %s fail\n", ifname);
-			}
-		} else {
+	if (ppa_is_netif_wifi(netif)) {
+		if (ppa_netif_add(ifname, NETIF_LAN_IF, NULL, NULL, 0) != PPA_SUCCESS)
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
-				"%s : dp_get_netif_subifid Failed ifname: %s\n", __func__, ifname);
-		}
-		ppa_free(dp_subif);
+				  "ppa_netif_add %s fail\n", ifname);
+#if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+		/* Refresh the qos helper's cached copy of def_eg_sess[]
+		 * so that subsequent tc QoS events don't feed stale PP session IDs to
+		 * pp_session_dst_queue_update().
+		 */
+		ppa_qos_helper_dev_refresh(netif);
+#endif
 	}
 
 	if (ppa_get_netif_info(ifname, &p_ifinfo) == PPA_SUCCESS) {

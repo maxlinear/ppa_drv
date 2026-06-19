@@ -222,11 +222,16 @@ static int32_t ppa_qos_session_dst_queue_update(netdev_qos_priv *devpriv,
 		return PPA_FAILURE;
 	}
 
-	ret = pp_session_dst_queue_update(devpriv->dfl_eg_sess[q_prio - 1],
+	if (q_prio < 0 || q_prio >= DP_DFL_SESS_NUM) {
+		MODULE_ERR("q_prio=%d out of range [0,%d]\n", q_prio, DP_DFL_SESS_NUM);
+		return PPA_FAILURE;
+	}
+
+	ret = pp_session_dst_queue_update(devpriv->dfl_eg_sess[q_prio],
 		q_logic.q_logic_id);
 	if (unlikely(ret)) {
-		MODULE_ERR("Failed to set session %d dest queue to %d, ret %d\n",
-		devpriv->dfl_eg_sess[q_prio - 1], q_logic.q_logic_id, ret);
+		MODULE_ERR("Failed to set session %u dest queue to %d, q_prio=%d, ret=%d\n",
+			   devpriv->dfl_eg_sess[q_prio], q_logic.q_logic_id, q_prio, ret);
 		return PPA_FAILURE;
 	}
 
@@ -250,7 +255,7 @@ static int32_t ppa_qos_event_netif_q_add_ops(netdev_qos_priv *devpriv,
 		return PPA_FAILURE;
 	}
 
-	if (q_prio >= PORT_MAX_Q) {
+	if (q_prio < 0 || q_prio >= PORT_MAX_Q) {
 		atomic_inc(&db->stats.q_err);
 		MODULE_ERR("Invalid q_prio(%d) for Dev(%s)\n", q_prio,
 				devpriv->netif->name);
@@ -382,15 +387,17 @@ static void ppa_qos_wq_handler(netdev_qos_priv *devpriv,
 			(r_event == QOS_EVENT_Q_DELETE) ? "Q DEL" :
 			(r_event == QOS_EVENT_SCH_ADD) ? "SCH ADD" :
 			(r_event == QOS_EVENT_SCH_DELETE) ? "SCH DEL" :
+			(r_event == QOS_EVENT_MAP_ADD) ? "MAP ADD" :
+			(r_event == QOS_EVENT_MAP_DELETE) ? "MAP DEL" :
 			"Invalid event!!");
 
-	if (r_event == QOS_EVENT_Q_ADD) {
+	if (r_event == QOS_EVENT_Q_ADD || r_event == QOS_EVENT_MAP_ADD) {
 		devpriv->ops.queue_add(devpriv, r_q, r_idx, data->flags);
 		/* flush sessions on the interface. */
 		/* evaluate performance impact!! */
 		/* time taken to flush sessions */
 		devpriv->ops.flush_sessions(devpriv->dpid, -1);
-	} else if (r_event == QOS_EVENT_Q_DELETE) {
+	} else if (r_event == QOS_EVENT_Q_DELETE || r_event == QOS_EVENT_MAP_DELETE) {
 		devpriv->ops.queue_del(devpriv, r_q, r_idx, data->flags);
 		/* now flush sessions on received qid. */
 		devpriv->ops.flush_sessions(devpriv->dpid, wq_data->pp_q);
@@ -705,7 +712,7 @@ static int32_t ppa_validate_qos_data(qos_notifier_data *rdata, u64 event)
 		return PPA_FAILURE;
 	}
 
-	if (unlikely(event > QOS_EVENT_SCH_DELETE)) {
+	if (unlikely(event > QOS_EVENT_MAP_DELETE)) {
 		MODULE_DBG("Invalid event %llu\n", event);
 		return PPA_FAILURE;
 	}
@@ -755,7 +762,8 @@ static int32_t ppa_notify_handler(struct notifier_block *unused, ulong event,
 	wq_data->event_type = event;
 	pdata = wq_data->data;
 
-	if (event == QOS_EVENT_Q_ADD || event == QOS_EVENT_Q_DELETE)
+	if (event == QOS_EVENT_Q_ADD || event == QOS_EVENT_Q_DELETE ||
+	    event == QOS_EVENT_MAP_ADD || event == QOS_EVENT_MAP_DELETE)
 		wq_data->pp_q = ppa_dpm_to_pp_qos(pdata->qid);
 
 	r_dev = pdata->netif;
@@ -1177,6 +1185,89 @@ int32_t ppa_qos_helper_dev_modify(PPA_NETIF *oldif, PPA_NETIF *newif)
 	}
 	rcu_read_unlock();
 	return PPA_FAILURE;
+}
+
+#if !IS_ENABLED(CONFIG_QOS_MGR)
+/**
+ * @brief Re-read DPM subif state for an interface so that the cached
+ *        dfl_eg_sess[] / alloc_flag / def_q / dpid stay in sync if DPM
+ *        re-registered the subif at runtime (e.g. WiFi VAP disable/enable
+ *        via the data model). Does NOT touch qid_map[] or num_q.
+ * @param netdev_qos_priv
+ * @return PPA_SUCCESS/PPA_FAILURE
+ */
+static int32_t ppa_netdev_refresh_dfl_sess(netdev_qos_priv *priv)
+{
+	dp_subif_t *dp_subif __free(kfree) = NULL;
+	PPA_NETIF *phy_dev = NULL;
+	PPA_IFNAME phys_netif_name[PPA_IF_NAME_SIZE];
+	struct atm_vcc *vcc = NULL;
+
+	if (!priv || !priv->netif) {
+		atomic_inc(&db->stats.dev_err.invalid);
+		return PPA_FAILURE;
+	}
+
+	if (ppa_get_physical_if(priv->netif, NULL, phys_netif_name) != PPA_SUCCESS) {
+		atomic_inc(&db->stats.dev_err.phy_invalid);
+		return PPA_FAILURE;
+	}
+	phy_dev = ppa_get_netif(phys_netif_name);
+	if (!phy_dev || !phy_dev->name[0]) {
+		atomic_inc(&db->stats.dev_err.phy_invalid);
+		return PPA_FAILURE;
+	}
+
+	dp_subif = kzalloc(sizeof(*dp_subif), GFP_KERNEL);
+	if (!dp_subif)
+		return PPA_FAILURE;
+
+	ppa_br2684_get_vcc(phy_dev, &vcc);
+	if (dp_get_netif_subifid(phy_dev, NULL, vcc, 0, dp_subif, 0) != PPA_SUCCESS) {
+		atomic_inc(&db->stats.dp_err);
+		MODULE_DBG("Failed to get subifId for <%s>\n", priv->netif->name);
+		return PPA_FAILURE;
+	}
+
+	ppa_memcpy(priv->dfl_eg_sess, dp_subif->dfl_eg_sess,
+		   sizeof(dp_subif->dfl_eg_sess));
+	priv->alloc_flag = dp_subif->alloc_flag;
+	priv->def_q      = dp_subif->def_qid;
+	priv->dpid       = dp_subif->port_id;
+	return PPA_SUCCESS;
+}
+#endif /* !CONFIG_QOS_MGR */
+
+/**
+ * Refresh cached DPM subif state for an interface already tracked by the
+ * QoS helper. Intended to be called from NETDEV_UP after DPM may have
+ * re-allocated the subif (e.g. WiFi VAP disable/enable via the data model).
+ * Only refreshes dfl_eg_sess[]/alloc_flag/def_q/dpid; qid_map[]/num_q
+ * populated by tc events are left untouched.
+ */
+int32_t ppa_qos_helper_dev_refresh(PPA_NETIF *dev)
+{
+#if !IS_ENABLED(CONFIG_QOS_MGR)
+	netdev_qos_priv *devpriv = NULL;
+	int32_t ret;
+
+	if (!dev)
+		return PPA_FAILURE;
+
+	rcu_read_lock();
+	devpriv = ppa_netdev_qos_data_lookup(dev, NULL);
+	rcu_read_unlock();
+	if (!devpriv)
+		return PPA_SUCCESS; /* not tracked — nothing to refresh */
+
+	ret = ppa_netdev_refresh_dfl_sess(devpriv);
+	if (ret != PPA_SUCCESS)
+		MODULE_ERR("dfl_eg_sess refresh failed for (%s)\n", dev->name);
+	return ret;
+#else
+	(void)dev;
+	return PPA_SUCCESS;
+#endif
 }
 
 int32_t ppa_qos_helper_dev_add(PPA_NETIF *dev)
