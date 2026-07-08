@@ -882,11 +882,11 @@ int32_t init_app_lp(void)
 	ppa_memset(&g_lpdev, 0, sizeof(g_lpdev));
 	/*Allocate netdevice */
 	g_lpdev.dev = alloc_etherdev_mq(sizeof(struct lpdev_priv), 8);
-	lpdev_setup(g_lpdev.dev);
 	if (!g_lpdev.dev) {
 		pr_err("alloc_netdev failed for lpdev0\n");
 		return PPA_FAILURE;
 	}
+	lpdev_setup(g_lpdev.dev);
 
 	priv = netdev_priv(g_lpdev.dev);
 	if (!priv) {

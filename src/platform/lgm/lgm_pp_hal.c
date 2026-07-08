@@ -1924,6 +1924,14 @@ static int init_ipsec_lld_nf(void)
 #endif
 
 #if IS_ENABLED(CONFIG_INTEL_VPN) || IS_ENABLED(CONFIG_MXL_VPN)
+static inline void ppa_vpn_parse_cleartext_rx(struct sk_buff *skb,
+					      struct net_device *dev)
+{
+	skb_reset_mac_header(skb);
+	skb->dev = dev;
+	pktprs_do_parse(skb, dev, PKTPRS_ETH_RX);
+}
+
 static inline int32_t ppa_vpn_parse_rx(struct sk_buff *skb,
 				       struct net_device *dev,
 				       uint16_t tunnel_id)
@@ -1957,9 +1965,7 @@ static inline int32_t ppa_vpn_parse_rx(struct sk_buff *skb,
 	if (sp) {
 		xs = xfrm_input_state(skb);
 		if (xs && xs->if_id) {
-			skb_reset_mac_header(skb);
-			skb->dev = dev;
-			pktprs_do_parse(skb, dev, PKTPRS_ETH_RX);
+			ppa_vpn_parse_cleartext_rx(skb, dev);
 			dbg("XFRM if_id=%u: parsed cleartext for S2 learning, dev=%s",
 			    xs->if_id, dev ? dev->name : "null");
 			goto exit;
@@ -1967,14 +1973,30 @@ static inline int32_t ppa_vpn_parse_rx(struct sk_buff *skb,
 	}
 #endif
 
-	if (!(!list_empty(&tunn_info->sessions) && tunn_info->is_inbound))
+	/*
+	 * Plain tunnel inbound packets are already cleartext after VPNA decap.
+	 * Learn S2 directly and do not rebuild an ESP envelope.
+	 *
+	 * Keep transport mode on the legacy path below.
+	 */
+#if IS_ENABLED(CONFIG_XFRM_INTERFACE)
+	if (!tunn_info->trns_mode && (!sp || !xs || !xs->if_id)) {
+#else
+	if (!tunn_info->trns_mode) {
+#endif
+		ppa_vpn_parse_cleartext_rx(skb, dev);
+		dbg("plain tunnel inbound: cleartext RX parsed, dev=%s",
+		    dev ? dev->name : "null");
 		goto exit;
+	}
 
-	skb_reset_mac_header(skb);
-	skb->dev = dev;
+	if (!(!list_empty(&tunn_info->sessions) && tunn_info->is_inbound)) {
+		dbg("IPsec inbound: no sessions or not inbound, skip S2 learning");
+		goto exit;
+	}
 
 	/* Call learning ingress for 2nd round session rx packet */
-	pktprs_do_parse(skb, dev, PKTPRS_ETH_RX);
+	ppa_vpn_parse_cleartext_rx(skb, dev);
 	rx_hdr = pktprs_skb_hdr_get(skb);
 	if (!rx_hdr) {
 		pr_err_ratelimited("Failed to get RX pktprs header\n");
@@ -5972,6 +5994,126 @@ static int32_t udp_sk_lookup(struct pktprs_desc *desc,
 	return PPA_SUCCESS;
 }
 
+/* litepath CPU-OUT NAT: restore pre-NAT src IP/port in RX descriptor. */
+static void litepath_nat_prepare_rx(struct uc_session_node *p_item,
+				struct pktprs_desc *desc)
+{
+	struct iphdr *rxip;
+
+	/* IPv6 sessions are filtered out at the call site. */
+	rxip = pktprs_ipv4_hdr(desc->rx, PKTPRS_HDR_LEVEL0);
+	if (!rxip)
+		return;
+
+	if (p_item->flags & SESSION_VALID_NAT_IP) {
+		dbg("litepath NAT RX: nat_ip %pI4 -> src_ip %pI4",
+		    &rxip->saddr, &p_item->pkt.src_ip.ip);
+		ppa_memcpy(&rxip->saddr, &p_item->pkt.src_ip.ip, sizeof(rxip->saddr));
+	}
+	if (p_item->flags & SESSION_VALID_NAT_PORT) {
+		__be16 *sport;
+
+		if (!(PKTPRS_IS_TCP(desc->rx, PKTPRS_HDR_LEVEL0) ||
+		      PKTPRS_IS_UDP(desc->rx, PKTPRS_HDR_LEVEL0))) {
+			dbg("litepath NAT RX: non-TCP/UDP, skip port write\n");
+			return;
+		}
+		sport = (__be16 *)(desc->rx->buf +
+				  pktprs_ip_hdr_off(desc->rx, PKTPRS_HDR_LEVEL0) +
+				  (rxip->ihl << 2));
+		dbg("litepath NAT RX: nat_port %u -> src_port %u",
+		    ntohs(*sport), p_item->pkt.src_port);
+		*sport = htons(p_item->pkt.src_port);
+	}
+}
+
+/*
+ * Build desc->tx from desc->rx for CPU-IN packets by stripping WAN-side
+ * encapsulation (VLAN/PPPoE) and forcing dummy L2 + session ethertype.
+ */
+static int litepath_strip_tx_encap_pktprs(struct uc_session_node *p_item,
+					  struct pktprs_desc *desc)
+{
+	enum pktprs_proto proto;
+	int i;
+
+#define STRIP_PROTO_OR_FAIL(_proto, _name) \
+	do { \
+		if (test_bit((_proto), &desc->tx->proto_bmap[PKTPRS_HDR_LEVEL0]) && \
+		    pktprs_proto_remove(desc->tx, (_proto), PKTPRS_HDR_LEVEL0)) { \
+			dbg("litepath PPPoE strip: %s remove failed\\n", (_name)); \
+			return -EIO; \
+		} \
+	} while (0)
+
+	/* Use rx as the starting point so we inherit the full proto stack */
+	ppa_memcpy(desc->tx, desc->rx, sizeof(*desc->tx));
+
+	/* Strip WAN-side encapsulation from tx; litepath gets plain ETH+IP. */
+	STRIP_PROTO_OR_FAIL(PKTPRS_PROTO_PPPOE, "PPPOE");
+	STRIP_PROTO_OR_FAIL(PKTPRS_PROTO_PPP, "PPP");
+
+	/* Strip any VLAN tags so the litepath egress sees a plain MAC|IP frame */
+	for (i = 0; i < MAX_VLAN_HDRS_SUPPORTED; i++) {
+		proto = PKTPRS_PROTO_VLAN0 + i;
+		STRIP_PROTO_OR_FAIL(proto, "VLAN");
+	}
+
+#undef STRIP_PROTO_OR_FAIL
+
+	/* Replace the PPPoE-bearing eth header with the litepath dummy L2 */
+	dbg("litepath NAT TX (PPPoE strip): dummy L2, proto 0x%04x",
+	    ntohs(p_item->pkt.protocol));
+	ppa_memcpy(desc->tx->buf, get_lp_dummy_l2_header(), ETH_HLEN);
+	set_ethtype(desc->tx, p_item->pkt.protocol);
+
+	return 0;
+}
+
+/* litepath CPU-IN NAT: set NAT'd L2/IP/port in TX descriptor (IPv4 only). */
+static void litepath_nat_prepare_tx(struct uc_session_node *p_item,
+				struct pktprs_desc *desc)
+{
+	struct iphdr *txip;
+
+	/* IPv6 sessions are filtered out at the call site. */
+	txip = pktprs_ipv4_hdr(desc->tx, PKTPRS_HDR_LEVEL0);
+	if (txip) {
+		dbg("litepath NAT TX: set dummy L2, proto 0x%04x",
+		    ntohs(p_item->pkt.protocol));
+		ppa_memcpy(desc->tx->buf, get_lp_dummy_l2_header(), ETH_HLEN);
+		set_ethtype(desc->tx, p_item->pkt.protocol);
+	} else {
+		/* PPPoE CPU-IN: rebuild desc->tx from desc->rx and strip WAN encapsulation */
+		if (litepath_strip_tx_encap_pktprs(p_item, desc))
+			return;
+		txip = pktprs_ipv4_hdr(desc->tx, PKTPRS_HDR_LEVEL0);
+		if (!txip)
+			return;
+	}
+
+	if (p_item->flags & SESSION_VALID_NAT_IP) {
+		dbg("litepath NAT TX: dst_ip %pI4 -> nat_ip %pI4",
+		    &p_item->pkt.dst_ip.ip, &p_item->pkt.nat_ip.ip);
+		txip->daddr = p_item->pkt.nat_ip.ip;
+	}
+	if (p_item->flags & SESSION_VALID_NAT_PORT) {
+		__be16 *dport;
+
+		if (!(PKTPRS_IS_TCP(desc->tx, PKTPRS_HDR_LEVEL0) ||
+		      PKTPRS_IS_UDP(desc->tx, PKTPRS_HDR_LEVEL0))) {
+			dbg("litepath NAT TX: non-TCP/UDP, skip port write\n");
+			return;
+		}
+		dport = (__be16 *)(desc->tx->buf +
+				  pktprs_ip_hdr_off(desc->tx, PKTPRS_HDR_LEVEL0) +
+				  (txip->ihl << 2) + sizeof(__be16));
+		dbg("litepath NAT TX: dst_port %u -> nat_port %u",
+		    p_item->pkt.dst_port, p_item->pkt.nat_port);
+		*dport = htons(p_item->pkt.nat_port);
+	}
+}
+
 /*!
 	\fn int32_t add_routing_entry(PPA_ROUTING_INFO *route_info)
 	\ingroup PPA_lgm_pp_hal_GLOBAL_FUNCTIONS
@@ -6355,6 +6497,13 @@ non_lro_ppv4_session:
 		/* update MAC with correct eth type */
 		ppa_memcpy(desc->rx->buf, get_lp_dummy_l2_header(), ETH_HLEN);
 		set_ethtype(desc->rx, p_item->pkt.protocol);
+		/*
+		 * litepath_nat_prepare_rx() is IPv4-only; IPv6 NAT sessions
+		 * skip it (desc->rx already mirrors desc->tx above).
+		 */
+		if (PPA_IS_NAT_SESSION(p_item->flags) &&
+		    !(p_item->flags & SESSION_IS_IPV6))
+			litepath_nat_prepare_rx(p_item, desc);
 		p_item->rx_if = ppa_get_lp_dev();
 		set_bit(PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT, &rt_entry.flags);
 		rt_entry.color = PP_COLOR_GREEN;
@@ -6362,7 +6511,17 @@ non_lro_ppv4_session:
 
 	if ((p_item->flag2 & SESSION_FLAG2_CPU_IN) &&
 	    !(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) {
-		ppa_memcpy(desc->tx, desc->rx, sizeof(struct pktprs_hdr));
+		/*
+		 * litepath_nat_prepare_tx() is IPv4-only; for IPv6 NAT
+		 * sessions skip it and just mirror desc->rx into desc->tx
+		 * so PP at least gets a valid TX descriptor (no fast-path
+		 * NAT).
+		 */
+		if (PPA_IS_NAT_SESSION(p_item->flags) &&
+		    !(p_item->flags & SESSION_IS_IPV6))
+			litepath_nat_prepare_tx(p_item, desc);
+		else
+			ppa_memcpy(desc->tx, desc->rx, sizeof(struct pktprs_hdr));
 	}
 
 	/* Fill in the fv information */

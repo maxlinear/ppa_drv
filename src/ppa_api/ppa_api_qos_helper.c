@@ -1400,6 +1400,15 @@ int32_t ppa_qos_helper_dev_del(struct netif_info *p_ifinfo)
 	mutex_unlock(&db->db_lock);
 #if IS_ENABLED(CONFIG_QOS_NOTIFY)
 	cancel_work_sync(&devpriv->dev_event_worker);
+	{
+		qos_wq_data *wd, *tmp;
+
+		list_for_each_entry_safe(wd, tmp, &devpriv->pending_ev_list, list) {
+			list_del(&wd->list);
+			kfree(wd->data);
+			kfree(wd);
+		}
+	}
 #endif
 	if (devpriv->dev_wq)
 		destroy_workqueue(devpriv->dev_wq);
@@ -1422,6 +1431,15 @@ void ppa_qos_helper_dev_del_all(void)
 		ppa_del_netdev_qos_priv(pos);
 #if IS_ENABLED(CONFIG_QOS_NOTIFY)
 		cancel_work_sync(&pos->dev_event_worker);
+		{
+			qos_wq_data *wd, *tmp;
+
+			list_for_each_entry_safe(wd, tmp, &pos->pending_ev_list, list) {
+				list_del(&wd->list);
+				kfree(wd->data);
+				kfree(wd);
+			}
+		}
 #endif
 		if (pos->dev_wq)
 			destroy_workqueue(pos->dev_wq);

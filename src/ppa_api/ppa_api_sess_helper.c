@@ -1,30 +1,30 @@
 /*******************************************************************************
  **
- ** FILE NAME	: ppa_api_sess_helper.c
- ** PROJECT	  : PPA
- ** MODULES	  : PPA API - Routing/Bridging(flow based) helper routines
- **
- ** DATE		 : 24 Feb 2015
- ** AUTHOR	   : Mahipati Deshpande
- ** DESCRIPTION  : PPA Protocol Stack Hook API Session Operation Functions
- ** COPYRIGHT : Copyright © 2020-2024 MaxLinear, Inc.
- **             Copyright (c) 2009
- **	        Lantiq Deutschland GmbH
- **	        Am Campeon 3; 85579 Neubiberg, Germany
+ ** FILE NAME     : ppa_api_sess_helper.c
+ ** PROJECT       : PPA
+ ** MODULES       : PPA API - Routing/Bridging(flow based) helper routines
+ ** DATE          : 24 Feb 2015
+ ** AUTHOR        : Mahipati Deshpande
+ ** DESCRIPTION   : PPA Protocol Stack Hook API Session Operation Functions
+ ** COPYRIGHT     : Copyright © 2020-2026 MaxLinear, Inc.
+ **	            Copyright (c) 2009
+ **	            Lantiq Deutschland GmbH
+ **	            Am Campeon 3; 85579 Neubiberg, Germany
  **
  **   For licensing information, see the file 'LICENSE' in the root folder of
  **   this software module.
  **
  ** HISTORY
- ** $Date		$Author				$Comment
- ** 24 Feb 2015  Mahipati			   The helper functions are moved from
- **									 ppa_api_session.c
- *******************************************************************************/
+ ** $Date               $Author         $Comment
+ ** 24 Feb 2015         Mahipati        The helper functions are moved from
+ **                                     ppa_api_session.c
+ ******************************************************************************/
 
 #include <linux/version.h>
 #include <generated/autoconf.h>
 #include <linux/swap.h>
 
+#include <net/netfilter/nf_conntrack.h>
 #include <net/ppa/ppa_api.h>
 #include <net/ppa/ppa_drv_wrapper.h>
 #include <net/ppa/ppa_hal_wrapper.h>
@@ -278,6 +278,12 @@ void ppa_session_list_free_item(struct uc_session_node *p_item)
 	}
 #endif
 	ppa_hsel_del_routing_session(p_item);
+
+	/* Fix 2: Release conntrack reference with deadlock-safe helper */
+	if (p_item->session) {
+		nf_ct_put(p_item->session);
+		p_item->session = NULL;
+	}
 
 #if IS_ENABLED(CONFIG_PPA_API_SW_FASTPATH)
 #if defined(PPA_IF_MIB) && PPA_IF_MIB

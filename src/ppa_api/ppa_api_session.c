@@ -41,6 +41,7 @@
 #include <net/tcp.h>
 #include <net/netfilter/nf_conntrack_timeout.h>
 #include <net/netfilter/nf_conntrack_l4proto.h>
+#include <net/netfilter/nf_conntrack.h>
 
 #if IS_ENABLED(CONFIG_PPA_EXT_PKT_LEARNING)
 #include <linux/pktprs.h>
@@ -393,6 +394,103 @@ static void pktprs_dst_ip(union nf_inet_addr *dstip,
 	}
 }
 
+/* Get destination tcp/udp port */
+static uint16_t pktprs_dst_port(struct pktprs_hdr *h)
+{
+	__be16 port = 0;
+	uint8_t lvl;
+
+	if (!h)
+		return 0;
+
+	lvl = get_correct_hdr_lvl(h);
+	if (PKTPRS_IS_TCP(h, lvl))
+		port = pktprs_tcp_hdr(h, lvl)->dest;
+	else if (PKTPRS_IS_UDP(h, lvl))
+		port = pktprs_udp_hdr(h, lvl)->dest;
+	else if (PKTPRS_IS_ESP(h, lvl))
+		port = (pktprs_esp_hdr(h, lvl)->spi) & 0xFFFF;
+
+	return be16_to_cpup(&port);
+}
+
+static inline bool ppa_session_is_pppoe_cpu_in(struct uc_session_node *p_item)
+{
+	bool cpu_in, pppoe;
+
+	cpu_in = p_item->flag2 & SESSION_FLAG2_CPU_IN;
+	pppoe  = p_item->flags  & SESSION_VALID_PPPOE;
+
+	return cpu_in && pppoe;
+}
+
+/* Read IPv4 daddr and TCP/UDP dst port from skb. */
+static int ppa_skb_extract_dnat_dst_ip_port(PPA_BUF *skb,
+					    union nf_inet_addr *dstip,
+					    uint16_t *dport)
+{
+	if (skb->protocol == htons(ETH_P_IP)) {
+		struct iphdr *iph;
+		__be16 *ports;
+
+		iph = ip_hdr(skb);
+
+		dstip->ip = iph->daddr;
+		*dport = 0;
+		if (iph->protocol == IPPROTO_TCP ||
+		    iph->protocol == IPPROTO_UDP) {
+			ports = (__be16 *)((u8 *)iph + (iph->ihl << 2));
+			*dport = ntohs(ports[1]);
+		}
+		return 0;
+	}
+
+	return -EPROTONOSUPPORT;
+}
+
+/* Fill DNAT IP/port from tx pktprs, or from skb when tx snapshot has no L3. */
+static void ppa_session_detect_dnat(struct uc_session_node *p_item,
+				    PPA_BUF *ppa_buf,
+				    struct pktprs_desc *desc)
+{
+	uint16_t nat_dport;
+	bool nat_ip_changed;
+
+	/* PPPoE LOCAL_IN is a known L2-reset case where tx pktprs can
+	 * mis-parse L3, so derive DNAT info from skb instead of desc->tx.
+	 */
+	if (ppa_session_is_pppoe_cpu_in(p_item)) {
+		nat_dport = 0;
+		if (ppa_skb_extract_dnat_dst_ip_port(ppa_buf,
+					    (union nf_inet_addr *)&p_item->pkt.natip.natsrcip.ip,
+					    &nat_dport) != 0) {
+			pr_debug("%s: PPPoE rx - skb fallback failed, skip DNAT detect\n",
+				 __func__);
+			return;
+		}
+		pr_debug("%s: PPPoE rx - derived DNAT from skb\n", __func__);
+		nat_ip_changed =
+			(p_item->pkt.natip.natsrcip.ip.ip != p_item->pkt.dst_ip.ip);
+	} else {
+		/* Default path: trust the pktprs TX snapshot. */
+		pktprs_dst_ip((union nf_inet_addr *)&p_item->pkt.natip.natsrcip.ip,
+			      desc->tx);
+		nat_ip_changed =
+			(ppa_memcmp(&p_item->pkt.natip.natsrcip.ip,
+				    &p_item->pkt.dst_ip,
+				    sizeof(PPA_IPADDR)) != 0);
+		nat_dport = pktprs_dst_port(desc->tx);
+	}
+
+	if (nat_ip_changed)
+		p_item->flags |= SESSION_VALID_NAT_IP;
+
+	p_item->pkt.nat_port = nat_dport;
+	if (p_item->pkt.nat_port &&
+	    p_item->pkt.nat_port != p_item->pkt.dst_port)
+		p_item->flags |= SESSION_VALID_NAT_PORT;
+}
+
 /* Check if the packet is IP frag but not the first frag */
 static int32_t pktprs_is_ip_frag_not_first(struct pktprs_hdr *h)
 {
@@ -472,26 +570,6 @@ static uint16_t pktprs_src_port(struct pktprs_hdr *h)
 		port = pktprs_udp_hdr(h, lvl)->source;
 	else if (PKTPRS_IS_ESP(h, lvl))
 		port = (pktprs_esp_hdr(h, lvl)->spi >> 16) & 0xFFFF;
-
-	return be16_to_cpup(&port);
-}
-
-/* Get destination tcp/udp port */
-static uint16_t pktprs_dst_port(struct pktprs_hdr *h)
-{
-	__be16 port = 0;
-	uint8_t lvl;
-
-	if (!h)
-		return 0;
-
-	lvl = get_correct_hdr_lvl(h);
-	if (PKTPRS_IS_TCP(h, lvl))
-		port = pktprs_tcp_hdr(h, lvl)->dest;
-	else if (PKTPRS_IS_UDP(h, lvl))
-		port = pktprs_udp_hdr(h, lvl)->dest;
-	else if (PKTPRS_IS_ESP(h, lvl))
-		port = (pktprs_esp_hdr(h, lvl)->spi) & 0xFFFF;
 
 	return be16_to_cpup(&port);
 }
@@ -2584,6 +2662,7 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
 	PPA_ROUTING_INFO route = {0};
 	PPA_MC_INFO	  mc	= {0};
 	uint64_t	tmp   = 0;
+	struct hlist_node *tmp_node = NULL;
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
 	uint32_t 	curr_time_jif;
 #endif
@@ -2602,8 +2681,14 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
 
 	for (i = 0; i < NUM_ENTITY(g_session_list_hash_table); i++) {
 		ppa_session_bucket_lock(i);
-		ppa_hlist_for_each_entry(p_item, &g_session_list_hash_table[i], hlist) {
-			tmp = 0;
+		/* Fix 4: Use safe variant to handle deletion during iteration */
+		ppa_hlist_for_each_entry_safe(p_item, tmp_node, &g_session_list_hash_table[i], hlist) {
+			/* Fix 3: Proactively delete sessions whose conntrack is dying */
+			if (p_item->session && unlikely(nf_ct_is_dying(p_item->session))) {
+				__ppa_session_delete_item(p_item);
+				continue;
+			}
+
 #if IS_ENABLED(CONFIG_SOC_GRX500)
 			route.entry = p_item->sess_hash;
 			route.p_item = p_item;
@@ -5075,46 +5160,6 @@ static bool tcp_sk_established(struct pktprs_desc *desc, int dir)
 	return true;
 }
 
-static bool _unsupported_nat(struct pktprs_desc *desc, int16_t l3_proto, uint16_t l4_proto)
-{
-	bool ret = false;
-
-	/* Early exits for invalid descriptors */
-	if (!desc || !desc->rx || !desc->tx)
-		return false;
-	
-	if(PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL0) ||
-	   PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL1)) 
-		return false;
-
-	if ((l3_proto == ETH_P_IP) && (l4_proto == PPA_IPPROTO_TCP || l4_proto == PPA_IPPROTO_UDP)) {
-		__be32 rx_ip, tx_ip;
-		__be16 rx_port = 0, nat_port = 0; 
-		PPA_NATIP srcip = { }, natip = { };
-
-		if (!pktprs_netif(desc->rx)) { /* CPU-out TCP traffic */
-			pktprs_src_ip((union nf_inet_addr *)&srcip.natsrcip.ip.ip, desc->rx);
-			pktprs_src_ip((union nf_inet_addr *)&natip.natsrcip.ip.ip, desc->tx);
-			rx_port  = pktprs_src_port(desc->rx);
-			nat_port = pktprs_src_port(desc->tx);
-		} else if (!pktprs_netif(desc->tx)) { /* CPU-in TCP traffic */
-			pktprs_dst_ip((union nf_inet_addr *)&srcip.natsrcip.ip.ip, desc->rx);
-			pktprs_dst_ip((union nf_inet_addr *)&natip.natsrcip.ip.ip, desc->tx);
-			rx_port  = pktprs_dst_port(desc->rx);
-			nat_port = pktprs_dst_port(desc->tx);
-		}	
-		rx_ip = srcip.natsrcip.ip.ip;
-		tx_ip = natip.natsrcip.ip.ip;
-
-		if ((rx_ip != tx_ip) || (rx_port != nat_port)) {
-			pr_debug("%s %d NAT: src(rx)=%pI4 -> src(tx)=%pI4 nat_port %d nat_port %d\n",
-				__FUNCTION__, __LINE__,  &rx_ip, &tx_ip, rx_port, nat_port);
-			ret = true;
-		}
-	}
-	return ret;
-}
-
 static bool _dos_filter(struct pktprs_desc *desc, PPA_SESSION *session,
 			uint16_t l3_proto, uint16_t l4_proto)
 {
@@ -5154,12 +5199,7 @@ static bool ppa_is_unsupported_dp(struct uc_session_node *p_item,
 	}
 
 	if (!p_item) {
-		bool ret = _dos_filter(desc, session, l3_proto, l4_proto);
-		/* if not DOS filter */	
-		if (ret == 0) {
-			return _unsupported_nat(desc, l3_proto, l4_proto);
-		}
-		return ret;
+		return _dos_filter(desc, session, l3_proto, l4_proto);
 	}
 
 	cpu_bound = p_item->flag2 & SESSION_FLAG2_CPU_BOUND;
@@ -5182,6 +5222,18 @@ static bool ppa_is_unsupported_dp(struct uc_session_node *p_item,
 				  __FUNCTION__, __LINE__, xs ? xs->xso.offload_handle: 0);
 			return true;
 		}
+	}
+
+	/* CPU_BOUND + IP fragments are unsupported: terminating/originating
+	 * flows can't be offloaded when the L4 header is split across frags
+	 * (only the first frag carries it, and PP needs full L3+L4).
+	 */
+	if (cpu_bound && d->rx &&
+	    (pktprs_is_ip_frag(d->rx, PKTPRS_HDR_LEVEL0) ||
+	     pktprs_is_ip_frag(d->rx, PKTPRS_HDR_LEVEL1))) {
+		pr_debug("(%s:%d) cpubound frag not supported\n",
+			 __FUNCTION__, __LINE__);
+		return true;
 	}
 
 	if (cpu_out) {
@@ -5614,6 +5666,9 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 
 		/* fill the session parameters */
 		p_item->session = ct;
+		/* Fix 1: Take reference to prevent use-after-free */
+		if (ct)
+			nf_conntrack_get(&ct->ct_general);
 		p_item->hash = cthash;
 
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
@@ -5637,13 +5692,9 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	  		p_item->flags |= SESSION_IS_TCP;
 		}
 
-		if (!(desc->rx->ifindex) && !((PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL0) || PKTPRS_IS_ESP(desc->tx, PKTPRS_HDR_LEVEL1)))) {
-			pktprs_src_ip((union nf_inet_addr *)&p_item->pkt.src_ip, desc->tx);
-			pktprs_dst_ip((union nf_inet_addr *)&p_item->pkt.dst_ip, desc->tx);
-		} else {
-			pktprs_src_ip((union nf_inet_addr *)&p_item->pkt.src_ip, desc->rx);
-			pktprs_dst_ip((union nf_inet_addr *)&p_item->pkt.dst_ip, desc->rx);
-		}
+		pktprs_src_ip((union nf_inet_addr *)&p_item->pkt.src_ip, desc->rx);
+		pktprs_dst_ip((union nf_inet_addr *)&p_item->pkt.dst_ip, desc->rx);
+
 		p_item->pkt.src_port = srcport;
 		p_item->pkt.dst_port = dstport;
 
@@ -6049,15 +6100,11 @@ update_session:
 				} else {
 					if (!PKTPRS_IS_ESP(desc->rx, PKTPRS_HDR_LEVEL0) &&
 						!PKTPRS_IS_ESP(desc->rx, PKTPRS_HDR_LEVEL1)) {
-						/* check and extract dnat info */
-						pktprs_dst_ip((union nf_inet_addr *)&p_item->pkt.natip.natsrcip.ip, desc->tx);
-						if (ppa_memcmp(&p_item->pkt.natip.natsrcip.ip, &p_item->pkt.dst_ip, sizeof(PPA_IPADDR)) != 0) {
-							p_item->flags |= SESSION_VALID_NAT_IP;
-						}
-						p_item->pkt.nat_port = pktprs_dst_port(desc->tx);
-						if (p_item->pkt.nat_port != p_item->pkt.dst_port) {
-							p_item->flags |= SESSION_VALID_NAT_PORT;
-						}
+						/* DNAT detect: pktprs TX snapshot, with skb
+						 * fallback for PPPoE CPU-IN rx where the
+						 * snapshot has no L3.
+						 */
+						ppa_session_detect_dnat(p_item, ppa_buf, desc);
 						/* TBD: l2 nat handling in case of tunnels*/
 					} else {
 						/* session is ipsec inbound */

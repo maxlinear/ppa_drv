@@ -2735,8 +2735,9 @@ PPA_NETIF *ppa_logical_netif_from_pktprs(struct pktprs_hdr *h, uint32_t dir,
 
 			/* if the interface is gre */
 			if((p->flags & NETIF_GRE_TUNNEL) && (pkt_gre))  {
-				if( p->netif->type == ARPHRD_IP6GRE || (ppa_is_ipv6_gretap_fn &&
-						ppa_is_ipv6_gretap_fn(p->netif)) ) {
+				if( (p->netif->type == ARPHRD_IP6GRE || (ppa_is_ipv6_gretap_fn &&
+						ppa_is_ipv6_gretap_fn(p->netif))) &&
+						PKTPRS_IS_IPV6(h, PKTPRS_HDR_LEVEL0) ) {
 					if(!ppa_pkt_from_tunnelv6_netdev(p->netif,
 						((dir==PKT_TX)? pktprs_ipv6_hdr(h, PKTPRS_HDR_LEVEL0)->saddr:pktprs_ipv6_hdr(h, PKTPRS_HDR_LEVEL0)->daddr),
 						((dir==PKT_TX)? pktprs_ipv6_hdr(h, PKTPRS_HDR_LEVEL0)->daddr:pktprs_ipv6_hdr(h, PKTPRS_HDR_LEVEL0)->saddr))) {
@@ -2744,7 +2745,7 @@ PPA_NETIF *ppa_logical_netif_from_pktprs(struct pktprs_hdr *h, uint32_t dir,
 					} else {
 						gre_match=1;
 					}
-				} else {
+				} else if (PKTPRS_IS_IPV4(h, PKTPRS_HDR_LEVEL0)) {
 					if(!ppa_pkt_from_tunnelv4_netdev(p->netif,
 						((dir==PKT_TX)? pktprs_ipv4_hdr(h, PKTPRS_HDR_LEVEL0)->saddr:pktprs_ipv4_hdr(h, PKTPRS_HDR_LEVEL0)->daddr),
 						((dir==PKT_TX)? pktprs_ipv4_hdr(h, PKTPRS_HDR_LEVEL0)->daddr:pktprs_ipv4_hdr(h, PKTPRS_HDR_LEVEL0)->saddr))) {
@@ -3185,10 +3186,19 @@ PPA_API_NETIF_MANAGER_INIT_FAIL:
 
 void ppa_api_netif_manager_exit(void)
 {
+	struct iface_list *local, *tmp;
+
 	ppa_netif_remove_list();
 	ppa_unregister_netdevice_notifier(&ppa_netdevice_notifier);
 	ppa_netif_free_list();
 	ppa_phys_port_free_list();
+
+	ppa_manual_if_lock_list();
+	ppa_list_for_each_entry_safe(local, tmp, &manual_del_iface_list, node_ptr) {
+		ppa_list_del(&local->node_ptr);
+		ppa_free(local);
+	}
+	ppa_manual_if_unlock_list();
 
 #if IS_ENABLED(CONFIG_QOS_TC)
 	ppa_qos_tc_lif_info_exit();
