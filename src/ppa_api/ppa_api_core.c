@@ -43,6 +43,7 @@
 
 #include "ppa_api_misc.h"
 #include "ppa_api_netif.h"
+#include "ppa_api_soc_al.h"
 #include "ppa_api_sess_helper.h"
 #include "ppa_api_session.h"
 #if defined(CONFIG_PPA_HANDLE_CONNTRACK_SESSIONS)
@@ -330,7 +331,7 @@ bool del_filter_entry (PPA_HAL_ID hal_id, FILTER_INFO *entry)
 	}
 
 	list_del_rcu(&filter_node->list);
-	call_rcu(&entry->rcu, free_session_filter_rcu);
+	call_rcu(&filter_node->rcu, free_session_filter_rcu);
 	mutex_unlock(&g_session_filter_lock);
 
 	return true;
@@ -1971,6 +1972,9 @@ static int32_t ppa_add_upperif_accel_stats(PPA_NETIF_ACCEL_STATS *p_stats, struc
 int32_t ppa_get_netif_accel_stats(PPA_IFNAME *ifname, PPA_NETIF_ACCEL_STATS *p_stats, uint32_t flags, struct rtnl_link_stats64 *storage)
 {
 	struct netif_info *p_info;
+#ifdef PPA_IF_STAT_HELPER
+	typeof(p_info->netdev_ops_new->ndo_get_stats64) get_stats64 = NULL;
+#endif
 
 	if (!ifname || !p_stats)
 		return PPA_EINVAL;
@@ -1982,17 +1986,30 @@ int32_t ppa_get_netif_accel_stats(PPA_IFNAME *ifname, PPA_NETIF_ACCEL_STATS *p_s
 		return PPA_EINVAL;
 	}
 #ifdef PPA_IF_STAT_HELPER
-	if (p_info->netdev_ops) { /* PPA managed */
-		memset(storage, 0, sizeof(*storage));
-		if (p_info->netdev_ops->ndo_get_stats64)
-			p_info->netdev_ops->ndo_get_stats64(p_info->netif,
-							    storage);
-	} else { /* DPM managed */
-		memset(storage, 0, sizeof(*storage));
-		if (p_info->netdev_ops_new->ndo_get_stats64)
-			p_info->netdev_ops_new->ndo_get_stats64(p_info->netif,
-								storage);
-	}
+	memset(storage, 0, sizeof(*storage));
+
+	/* netdev_ops_new is allocated by ppa_netif_set_ops_features() and freed
+	 * by ppa_netif_reset_ops_features(), which can run concurrently with
+	 * this stats query (e.g. 'ip link' racing an interface going down).
+	 * Testing the pointer and dereferencing it without a lock is a
+	 * use-after-free: it can be cleared and freed in between, which is how
+	 * the NULL + offsetof(ndo_get_stats64) oops was hit. Sample the hook
+	 * under ops_lock, which the install/teardown paths also hold.
+	 */
+	ppa_netif_ops_lock(p_info);
+	if (p_info->netdev_ops) /* PPA managed */
+		get_stats64 = p_info->netdev_ops->ndo_get_stats64;
+	else if (p_info->netdev_ops_new) /* DPM managed */
+		get_stats64 = p_info->netdev_ops_new->ndo_get_stats64;
+	ppa_netif_ops_unlock(p_info);
+
+	/* Invoke outside the lock: the callback belongs to the lower driver and
+	 * may walk into PPA again (stacked netdev), which would invert the
+	 * ops_lock/g_netif_lock order. Skip our own hook, netdev_ops_new holds
+	 * it transiently while the ops are being installed.
+	 */
+	if (get_stats64 && get_stats64 != ppa_netif_get_stats64)
+		get_stats64(p_info->netif, storage);
 	storage->rx_dropped += (unsigned long)atomic_long_read(&p_info->netif->rx_dropped);
 	storage->tx_dropped += (unsigned long)atomic_long_read(&p_info->netif->tx_dropped);
 	storage->rx_nohandler += (unsigned long)atomic_long_read(&p_info->netif->rx_nohandler);

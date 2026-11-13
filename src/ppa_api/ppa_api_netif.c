@@ -202,6 +202,12 @@ static struct netif_info *ppa_netif_alloc_item(void)
 	obj = (struct netif_info *)ppa_malloc(sizeof(*obj));
 	if (obj) {
 		ppa_memset(obj, 0, sizeof(*obj));
+		if (ppa_lock_init(&obj->ops_lock)) {
+			ppa_debug(DBG_ENABLE_MASK_ERR,
+				  "Failed in creating lock for netif ops.\n");
+			ppa_free(obj);
+			return NULL;
+		}
 		obj->mac_entry = ~0;
 		ppa_atomic_set(&obj->count, 1);
 	}
@@ -224,6 +230,7 @@ static void ppa_netif_free_item(struct netif_info *obj)
 			ppa_set_wan_itf(&wanitf_cfg, 0);
 		}
 		ppa_netif_reset_ops_features(obj, obj->netif);
+		ppa_lock_destroy(&obj->ops_lock);
 		ppa_free(obj);
 	}
 }
@@ -239,6 +246,21 @@ void ppa_netif_unlock_list(void)
 	ppa_lock_release(&g_netif_lock);
 }
 EXPORT_SYMBOL(ppa_netif_unlock_list);
+
+/* Serialize install/teardown of ifinfo->netdev_ops[_new] against the readers
+ * of those ops, e.g. ppa_get_netif_accel_stats(). The lock is per netif_info
+ * so that stacked devices, whose ndo_get_stats64 may query a lower device,
+ * do not deadlock on each other.
+ */
+void ppa_netif_ops_lock(struct netif_info *ifinfo)
+{
+	ppa_lock_get(&ifinfo->ops_lock);
+}
+
+void ppa_netif_ops_unlock(struct netif_info *ifinfo)
+{
+	ppa_lock_release(&ifinfo->ops_lock);
+}
 
 static void __ppa_netif_add_item(struct netif_info *obj)
 {
@@ -845,6 +867,7 @@ static void ppa_unregister_new_netif(PPA_NETIF *netif)
 static void ppa_netif_set_ops_features(struct netif_info *ifinfo, PPA_NETIF *netif)
 {
 	bool is_phys_if, rtnl_locked, dpm_managed = true, ppa_ops_set = false;
+	struct net_device_ops *ops_new;
 	dp_subif_t *dp_subif = NULL;
 	netdev_features_t features;
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
@@ -896,14 +919,21 @@ static void ppa_netif_set_ops_features(struct netif_info *ifinfo, PPA_NETIF *net
 
 	rtnl_locked = rtnl_trylock();
 
-	/* Allocate a new net_device_ops to save the original ops hook */
+	/* Allocate a new net_device_ops to save the original ops hook.
+	 * Fill it before publishing it, so that a concurrent reader never
+	 * observes a partially initialized copy.
+	 */
 	if (!ifinfo->netdev_ops_new) {
-		ifinfo->netdev_ops_new = ppa_malloc(sizeof(struct net_device_ops));
-		if (!ifinfo->netdev_ops_new)
+		ops_new = ppa_malloc(sizeof(struct net_device_ops));
+		if (!ops_new)
 			goto unlock_out;
 
-		memcpy(ifinfo->netdev_ops_new, netif->netdev_ops,
+		memcpy(ops_new, netif->netdev_ops,
 		       sizeof(struct net_device_ops));
+
+		ppa_netif_ops_lock(ifinfo);
+		ifinfo->netdev_ops_new = ops_new;
+		ppa_netif_ops_unlock(ifinfo);
 	}
 
 	features = netif->features;
@@ -919,8 +949,10 @@ static void ppa_netif_set_ops_features(struct netif_info *ifinfo, PPA_NETIF *net
 						ndo_get_stats64),
 						DP_OPS_NETDEV);
 			} else {
+				ppa_netif_ops_lock(ifinfo);
 				ifinfo->netdev_ops_new->ndo_get_stats64 =
 						ppa_netif_get_stats64;
+				ppa_netif_ops_unlock(ifinfo);
 				ppa_ops_set = true;
 			}
 		}
@@ -989,8 +1021,10 @@ static void ppa_netif_set_ops_features(struct netif_info *ifinfo, PPA_NETIF *net
 	/* Set netif ops hook if it is managed by PPA */
 	if (ppa_ops_set && (netif->netdev_ops != ifinfo->netdev_ops_new)) {
 		if (!ifinfo->netdev_ops) {
+			ppa_netif_ops_lock(ifinfo);
 			ifinfo->netdev_ops = netif->netdev_ops;
 			netif->netdev_ops = ifinfo->netdev_ops_new;
+			ppa_netif_ops_unlock(ifinfo);
 		} else {
 			ppa_debug(DBG_ENABLE_MASK_ERR,
 				  "%s netdev_ops already set for netif:%s\n",
@@ -1010,6 +1044,7 @@ unlock_out:
 static void ppa_netif_reset_ops_features(struct netif_info *ifinfo, PPA_NETIF *netif)
 {
 	bool rtnl_locked, dpm_managed;
+	struct net_device_ops *ops_new;
 #if IS_ENABLED(CONFIG_QOS_TC)
 	netdev_features_t features;
 #endif
@@ -1051,10 +1086,12 @@ static void ppa_netif_reset_ops_features(struct netif_info *ifinfo, PPA_NETIF *n
 #if IS_ENABLED(CONFIG_QOS_TC)
 	} else if (!ifinfo->enable && ifinfo->is_tc_configured) {
 		/* Reset netdev_ops_new with default netdev_ops */
+		ppa_netif_ops_lock(ifinfo);
 		memcpy(ifinfo->netdev_ops_new, ifinfo->netdev_ops,
 		       sizeof(struct net_device_ops));
 		/* Override ndo_setup_tc for logical interfaces */
 		ifinfo->netdev_ops_new->ndo_setup_tc = ppa_qos_tc_setup;
+		ppa_netif_ops_unlock(ifinfo);
 
 		/* Set hw-tc-offload for logical interfaces */
 		features = netif->features;
@@ -1068,10 +1105,12 @@ static void ppa_netif_reset_ops_features(struct netif_info *ifinfo, PPA_NETIF *n
 	} else {
 		/* Reset netif ops hook */
 		if (netif->netdev_ops == ifinfo->netdev_ops_new) {
+			ppa_netif_ops_lock(ifinfo);
 			netif->netdev_ops = ifinfo->netdev_ops;
 			memcpy(ifinfo->netdev_ops_new, netif->netdev_ops,
 			       sizeof(struct net_device_ops));
 			ifinfo->netdev_ops = NULL;
+			ppa_netif_ops_unlock(ifinfo);
 		} else {
 			ppa_debug(DBG_ENABLE_MASK_ERR,
 				  "%s netdev_ops already reset for netif:%s\n",
@@ -1079,11 +1118,21 @@ static void ppa_netif_reset_ops_features(struct netif_info *ifinfo, PPA_NETIF *n
 		}
 	}
 
-	/* Free the allocated net_device_ops */
-	if (ifinfo->netdev_ops_new && !ifinfo->is_tc_configured) {
-		ppa_free(ifinfo->netdev_ops_new);
+	/* Free the allocated net_device_ops. Detach it under ops_lock first:
+	 * any reader (e.g. ppa_get_netif_accel_stats() called from
+	 * ndo_get_stats64) dereferences it only while holding that lock, so
+	 * once the pointer is cleared no reader can reach the freed memory.
+	 */
+	ppa_netif_ops_lock(ifinfo);
+	ops_new = ifinfo->netdev_ops_new;
+	if (ops_new && !ifinfo->is_tc_configured)
 		ifinfo->netdev_ops_new = NULL;
-	}
+	else
+		ops_new = NULL;
+	ppa_netif_ops_unlock(ifinfo);
+
+	if (ops_new)
+		ppa_free(ops_new);
 
 	if (rtnl_locked)
 		rtnl_unlock();

@@ -2394,6 +2394,7 @@ int32_t ppa_lro_entry_criteria(struct uc_session_node *p_item, PPA_BUF *ppa_buf,
 	   3. GRX: Session gets added to lro only if packet size is large (to avoid tcp ack) */
 
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
+	struct netif_info *rx_if = NULL;
 	/* if hw_litepath disabled, allow LRO session based on the
 	 * respective interface feature (NETIF_F_GRO_HW | NETIF_F_LRO)
 	 */
@@ -2401,6 +2402,14 @@ int32_t ppa_lro_entry_criteria(struct uc_session_node *p_item, PPA_BUF *ppa_buf,
 	    !(p_item->rx_if->features & (NETIF_F_GRO_HW | NETIF_F_LRO))) {
 		p_item->flags |= SESSION_NOT_ACCELABLE;
 		return PPA_FAILURE;
+	} else if (p_item->rx_if &&
+		   (ppa_netif_lookup(ppa_get_netif_name(p_item->rx_if), &rx_if) == PPA_SUCCESS)) {
+		if (rx_if && (rx_if->flags & NETIF_DIRECTCONNECT_WIFI)) {
+			p_item->flags |= SESSION_NOT_ACCELABLE;
+			ppa_netif_put(rx_if);
+			return PPA_FAILURE;
+		}
+		ppa_netif_put(rx_if);
 	}
 #endif
 

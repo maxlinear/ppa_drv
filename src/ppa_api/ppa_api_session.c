@@ -5498,6 +5498,7 @@ int32_t ppa_add_pp_session(struct pktprs_desc *desc, bool drop)
 	IP_ADDR_C mc_grp = {0};
 	uint8_t lvl0_off, lvl1_off;
 	bool is_frag;
+	bool tcp_unestablished;
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
 	PPA_SUBIF *dp_port;
 #endif
@@ -5793,21 +5794,51 @@ __ADD_SESSION_DONE:
 			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"Session already programmed in HW %s %d\n", __FUNCTION__, __LINE__);
 
 			/*
-			 * In case this is a non frag session, and frag was received
-			 * delete the session, and re-open
+			 * Drop the stale HW session when either of these is true:
+			 * 1) a fragmented packet arrives on a non-fragmented session, or
+			 * 2) a TCP connection is still not marked established.
+			 * Do not re-learn stale sessions from fragment context.
 			 */
 			is_frag = pktprs_first_frag(desc->rx, PKTPRS_HDR_LEVEL0) ||
 				  pktprs_first_frag(desc->rx, PKTPRS_HDR_LEVEL1);
-			if (is_frag && !(p_item->flag2 & SESSION_FLAG2_FRAG)) {
+			tcp_unestablished = (p_item->flags & SESSION_IS_TCP) &&
+				p_item->session &&
+				!ppa_is_tcp_established(p_item->session);
+			if ((is_frag && !(p_item->flag2 & SESSION_FLAG2_FRAG)) ||
+			    tcp_unestablished) {
+				struct uc_session_node *tmp_pitem;
+				PPA_SESSION *tcp_ct = NULL;
+
 				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
-					  "Received frag on non-frag session. Re-open session\n");
-				ppa_hsel_del_routing_session(p_item);
-				goto update_session;
-			} else if ((p_item->flags & SESSION_IS_TCP) && p_item->session &&
-				!ppa_is_tcp_established(p_item->session)) {
+					  "%s. Delete session\n",
+					  tcp_unestablished ?
+					  "TCP session not established" :
+					  "Received frag on non-frag session");
+				/* Pin conntrack for reverse-direction deletion after unlocking. */
+				if (tcp_unestablished &&
+				    refcount_inc_not_zero(&p_item->session->ct_general.use))
+					tcp_ct = p_item->session;
+				/*
+				 * The item free path calls ppa_hsel_del_routing_session()
+				 * which removes the HW entry and clears SESSION_ADDED_IN_HW.
+				 * The lookup ran without the bucket lock, so another CPU
+				 * may have unlinked p_item already: unlink it only if it
+				 * is still in the bucket, then drop the lookup reference.
+				 */
+				ppa_hlist_for_each_entry(tmp_pitem,
+						&g_session_list_hash_table[idx], hlist) {
+					if (tmp_pitem == p_item) {
+						__ppa_session_delete_item(p_item);
+						break;
+					}
+				}
 				__ppa_session_put(p_item);
 				ppa_session_bucket_unlock(idx);
-				ppa_session_delete(p_item->session, 0);
+				/* Delete PPA sessions in both directions after unlocking to avoid recursive bucket locking. */
+				if (tcp_ct) {
+					ppa_session_delete(tcp_ct, 0);
+					nf_ct_put(tcp_ct);
+				}
 				goto __SKIP_SESSION_ACTION;
 			}
 		} else if (p_item->flags & SESSION_ADDED_IN_SW) {
@@ -5835,7 +5866,6 @@ __ADD_SESSION_DONE:
 							p_item->num_adds, g_ppa_min_hits);
 	  				SET_DBG_FLAG(p_item, SESSION_DBG_NOT_REACH_MIN_HITS);
 			} else {
-update_session:
 				if (ppa_is_unsupported_dp(p_item, desc, NULL, 0, 0)) {
 					ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d Unsupported dp case\n",
 							__FUNCTION__, __LINE__);

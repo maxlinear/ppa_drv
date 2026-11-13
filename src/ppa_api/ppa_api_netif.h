@@ -225,6 +225,11 @@ struct netif_info {
 	struct net_device_ops	*netdev_ops_new;
 	const struct net_device_ops *netdev_ops;
 	netdev_features_t	delta_features;
+	/**
+	 *	@ops_lock:	Protects netdev_ops/netdev_ops_new against
+	 *			concurrent install, teardown and use
+	 */
+	PPA_LOCK		ops_lock;
 };
 
 struct iface_list {
@@ -286,6 +291,8 @@ int32_t ppa_netif_iterate_next(uint32_t *, struct netif_info **);
 void ppa_netif_stop_iteration(void);
 void ppa_netif_lock_list(void);
 void ppa_netif_unlock_list(void);
+void ppa_netif_ops_lock(struct netif_info *);
+void ppa_netif_ops_unlock(struct netif_info *);
 
 /*	inline functions
  */

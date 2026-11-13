@@ -1205,11 +1205,38 @@ static void mc_sess_args_prepare(struct pp_sess_create_args *pp_args)
 	/*End TBD Set*/
 }
 
+static int32_t mc_grp_vlan_remove(struct pktprs_hdr *tx,
+				 enum pktprs_proto proto)
+{
+	__be16 encaps_proto;
+	int16_t vlan_off;
+
+	vlan_off = pktprs_hdr_off(tx, proto, PKTPRS_HDR_LEVEL0);
+	if (vlan_off < 0)
+		return 0;
+	if (vlan_off < (int16_t)sizeof(encaps_proto) ||
+	    vlan_off + sizeof(struct vlan_hdr) > tx->buf_sz)
+		return PPA_FAILURE;
+
+	memcpy(&encaps_proto,
+	       tx->buf + vlan_off + offsetof(struct vlan_hdr,
+					     h_vlan_encapsulated_proto),
+	       sizeof(encaps_proto));
+	if (pktprs_proto_remove(tx, proto, PKTPRS_HDR_LEVEL0))
+		return PPA_FAILURE;
+
+	memcpy(tx->buf + vlan_off - sizeof(encaps_proto), &encaps_proto,
+	       sizeof(encaps_proto));
+	return 0;
+}
+
 static int32_t mc_grp_sess_args_prepare(struct pp_sess_create_args *pp_args,
 					struct lgm_mc_args *mc_args,
 					struct mc_session_node *p_item,
 					uint16_t ig_gid)
 {
+	int32_t ret;
+
 	mc_sess_args_prepare(pp_args);
 
 	/* Fill in the Hash information */
@@ -1229,12 +1256,22 @@ static int32_t mc_grp_sess_args_prepare(struct pp_sess_create_args *pp_args,
 	pp_args->dst_q = g_mcast_nf.qid;
 
 	/* remove dst member protocol, if any */
-	if (p_item->flags & SESSION_VALID_VLAN_INS)
-		pktprs_proto_remove(mc_args->desc->tx,
-				    PKTPRS_PROTO_VLAN0, PKTPRS_HDR_LEVEL0);
-	if (p_item->flags & SESSION_VALID_OUT_VLAN_INS)
-		pktprs_proto_remove(mc_args->desc->tx,
-				    PKTPRS_PROTO_VLAN1, PKTPRS_HDR_LEVEL0);
+	if (p_item->flags & SESSION_VALID_VLAN_INS) {
+		ret = mc_grp_vlan_remove(mc_args->desc->tx, PKTPRS_PROTO_VLAN0);
+		if (ret) {
+			pr_err_ratelimited("%s: VLAN_INS removal failed (VLAN0), ret=%d\n",
+					   __func__, ret);
+			return ret;
+		}
+	}
+	if (p_item->flags & SESSION_VALID_OUT_VLAN_INS) {
+		ret = mc_grp_vlan_remove(mc_args->desc->tx, PKTPRS_PROTO_VLAN1);
+		if (ret) {
+			pr_err_ratelimited("%s: OUT_VLAN_INS removal failed (VLAN1), ret=%d\n",
+					   __func__, ret);
+			return ret;
+		}
+	}
 
 	/*Filling in the FV information*/
 	pp_args->rx = mc_args->desc->rx;

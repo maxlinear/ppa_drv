@@ -1822,15 +1822,16 @@ void ppa_neigh_hh_init(struct neighbour *n)
 }
 EXPORT_SYMBOL(ppa_neigh_hh_init);
 
+/* Normalized local/remote endpoints: return 1 for a match, 0 for no match. */
 uint32_t ppa_pkt_from_tunnelv6_netdev( PPA_NETIF *netdev, struct in6_addr saddr, struct in6_addr daddr)
 {
 	struct ip6_tnl *tunnel;
 
 	tunnel = netdev_priv(netdev);
 	if(tunnel) {
-		if(!(ipv6_addr_equal(&saddr,&tunnel->parms.laddr) &&
-			ipv6_addr_equal(&daddr,&tunnel->parms.raddr))) {
-				return 1;
+		if (ipv6_addr_equal(&saddr, &tunnel->parms.laddr) &&
+		    ipv6_addr_equal(&daddr, &tunnel->parms.raddr)) {
+			return 1;
 		}
 	}
 

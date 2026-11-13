@@ -421,6 +421,14 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 		return PPA_FAILURE;
 	}
 
+	/* Fragmented sessions must not learn SW acceleration templates */
+	if (p_item->flag2 & SESSION_FLAG2_FRAG) {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+			  "%s %d skip SW meta for fragmented session\n",
+			  __FUNCTION__, __LINE__);
+		return PPA_FAILURE;
+	}
+
 #if IS_ENABLED(CONFIG_X86_INTEL_LGM) || IS_ENABLED(CONFIG_SOC_LGM)
 	if ((p_item->flags & SESSION_TUNNEL_ESP) || IsTunneledSession(p_item->flags)
 		|| IsGreSession(p_item->flag2)
@@ -584,11 +592,6 @@ int32_t swac_update_session_meta(PPA_SESSMETA_INFO *metainfo)
 		}
 	} else {
 		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"%s %d\n", __FUNCTION__, __LINE__);
-		if (p_item->flag2 & SESSION_FLAG2_FRAG) {
-			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "(%s:%d) No SWA fragmented pkts\n",
-				  __FUNCTION__, __LINE__);
-			return PPA_FAILURE;
-		}
 		/* IPV4/IPV6 session */
 		swaHdr.network_offset = swaHdr.transport_offset = tlen;
 		if( isIPv6 ) {
